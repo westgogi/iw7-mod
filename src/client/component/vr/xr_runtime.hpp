@@ -41,11 +41,28 @@ namespace vr
 		bool srgb = true;           // treat the game's image as gamma (sRGB) encoded
 	};
 
+	// Where the headset and both eyes are at a given time, in the LOCAL reference space
+	struct view_state
+	{
+		XrTime time = 0;
+		XrPosef head{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		XrPosef eye_pose[2]{};
+		XrFovf eye_fov[2]{};
+	};
+
+	// What a game frame was rendered with, so the headset can show it from the right place
+	struct projection_info
+	{
+		XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}}; // LOCAL space
+		XrFovf fov{};
+	};
+
 	const char* to_string(XrResult result);
 	const char* to_string(XrSessionState state);
 
-	// Owns the OpenXR instance, session and the "virtual screen" swapchain.
-	// Not thread-safe: the caller serialises access (the render thread drives it).
+	// Owns the OpenXR instance, session and the swapchain the game's image is copied into.
+	// The render thread drives it; the only calls allowed from other threads are locate() and predicted_time(),
+	// and only while the caller guarantees the object isn't being destroyed.
 	class xr_runtime
 	{
 	public:
@@ -68,9 +85,23 @@ namespace vr
 		// Blocks until the headset wants the next frame. Call WITHOUT holding the game's D3D11 lock.
 		bool wait_frame();
 
-		// Begins the frame, copies `source` (may be null) onto the virtual screen and ends the frame.
+		// Begins the frame, copies `source` (may be null) and ends the frame. With `projection` the image is shown
+		// head-tracked from the pose it was rendered with; without it, on the virtual screen.
 		// Only valid after wait_frame() returned true. Call WITH the game's D3D11 lock held.
-		void submit_screen_frame(ID3D11DeviceContext* context, ID3D11Texture2D* source, const screen_params& params);
+		void submit_frame(ID3D11DeviceContext* context, ID3D11Texture2D* source, const projection_info* projection,
+			const screen_params& params);
+
+		// Head and eye poses for `time` (thread-safe)
+		bool locate(XrTime time, view_state& out) const;
+
+		// Display time roughly `frames_ahead` frames after the frame the runtime last asked for; 0 if unknown
+		XrTime predicted_time(float frames_ahead) const;
+
+		// Counts runtime recentres (e.g. holding the Meta button); head tracking re-baselines when it changes
+		std::uint32_t space_change_count() const
+		{
+			return this->space_changes_;
+		}
 
 		void request_recenter();
 		std::string status() const;
@@ -94,9 +125,13 @@ namespace vr
 		XrSpace view_space_ = XR_NULL_HANDLE;
 
 		XrSessionState session_state_ = XR_SESSION_STATE_UNKNOWN;
-		bool session_running_ = false;
+		std::atomic_bool session_running_ = false;
 		bool frame_waited_ = false;
 		XrFrameState frame_state_{XR_TYPE_FRAME_STATE};
+		std::atomic<XrTime> last_display_time_ = 0;
+		std::atomic<XrDuration> display_period_ = 0;
+		std::atomic<std::uint32_t> space_changes_ = 0;
+		std::uint64_t projected_frames_ = 0;
 		XrEnvironmentBlendMode blend_mode_ = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
 		std::vector<std::int64_t> swapchain_formats_;

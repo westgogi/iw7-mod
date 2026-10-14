@@ -16,13 +16,21 @@
 
 #include "version.hpp"
 
-#define console_font game::R_RegisterFont("fonts/fira_mono_regular.ttf", 18)
+#define console_font game::R_RegisterFont("fonts/fira_mono_regular.ttf", console_font_size())
 #define material_white game::Material_RegisterHandle("white")
 
 namespace game_console
 {
 	namespace
 	{
+		// iw7-vr: the console is read through the headset, so its text size is adjustable (iw7-mod uses 18)
+		game::dvar_t* con_font_size = nullptr;
+
+		int console_font_size()
+		{
+			return con_font_size ? con_font_size->current.integer : 18;
+		}
+
 		struct console_globals
 		{
 			float x{};
@@ -912,6 +920,9 @@ namespace game_console
 			});
 
 			// add our dvars
+			con_font_size = game::Dvar_RegisterInt("con_fontSize", 36, 10, 72, game::DVAR_FLAG_SAVED,
+				"console text size (iw7-mod's default is 18)");
+
 			dvars::con_inputBoxColor = game::Dvar_RegisterVec4("con_inputBoxColor", 0.2f, 0.2f, 0.2f, 0.9f, 0.0f, 1.0f,
 				game::DVAR_FLAG_SAVED,
 				"color of console input box");

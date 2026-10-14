@@ -429,6 +429,7 @@ namespace vr
 			case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
 				// the player recentred with the headset's own button; move the screen with them
 				this->recenter_requested_ = true;
+				++this->space_changes_;
 				break;
 
 			default:
@@ -498,10 +499,73 @@ namespace vr
 		}
 
 		this->frame_waited_ = true;
+		this->last_display_time_ = this->frame_state_.predictedDisplayTime;
+		this->display_period_ = this->frame_state_.predictedDisplayPeriod;
 		return true;
 	}
 
-	void xr_runtime::submit_screen_frame(ID3D11DeviceContext* context, ID3D11Texture2D* source, const screen_params& params)
+	XrTime xr_runtime::predicted_time(const float frames_ahead) const
+	{
+		const auto last = this->last_display_time_.load();
+		if (last == 0)
+		{
+			return 0;
+		}
+
+		return last + static_cast<XrTime>(static_cast<double>(this->display_period_.load()) * frames_ahead);
+	}
+
+	bool xr_runtime::locate(const XrTime time, view_state& out) const
+	{
+		if (!this->session_running_ || time == 0)
+		{
+			return false;
+		}
+
+		XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
+		locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locate_info.displayTime = time;
+		locate_info.space = this->local_space_;
+
+		XrViewState view_state_info{XR_TYPE_VIEW_STATE};
+		std::array<XrView, 2> views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+		std::uint32_t count = 0;
+		if (XR_FAILED(xrLocateViews(this->session_, &locate_info, &view_state_info, 2, &count, views.data())) || count != 2)
+		{
+			return false;
+		}
+
+		constexpr XrViewStateFlags views_valid = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+		if ((view_state_info.viewStateFlags & views_valid) != views_valid)
+		{
+			return false;
+		}
+
+		XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+		if (XR_FAILED(xrLocateSpace(this->view_space_, this->local_space_, time, &head)))
+		{
+			return false;
+		}
+
+		constexpr XrSpaceLocationFlags head_valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+		if ((head.locationFlags & head_valid) != head_valid)
+		{
+			return false;
+		}
+
+		out.time = time;
+		out.head = head.pose;
+		for (auto i = 0u; i < 2; ++i)
+		{
+			out.eye_pose[i] = views[i].pose;
+			out.eye_fov[i] = views[i].fov;
+		}
+
+		return true;
+	}
+
+	void xr_runtime::submit_frame(ID3D11DeviceContext* context, ID3D11Texture2D* source, const projection_info* projection,
+		const screen_params& params)
 	{
 		if (!this->frame_waited_)
 		{
@@ -519,26 +583,59 @@ namespace vr
 		}
 
 		XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+		XrCompositionLayerProjection projection_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+		std::array<XrCompositionLayerProjectionView, 2> projection_views{{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+			{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}}};
 		std::array<XrCompositionLayerBaseHeader*, 1> layers{};
 		std::uint32_t layer_count = 0;
 
 		if (this->frame_state_.shouldRender && source && this->copy_to_screen(context, source, params.srgb))
 		{
-			this->update_anchor(this->frame_state_.predictedDisplayTime);
+			XrSwapchainSubImage image{};
+			image.swapchain = this->screen_.handle;
+			image.imageRect.offset = {0, 0};
+			image.imageRect.extent = {static_cast<std::int32_t>(this->screen_.width), static_cast<std::int32_t>(this->screen_.height)};
+			image.imageArrayIndex = 0;
 
-			const auto aspect = static_cast<float>(this->screen_.height) / static_cast<float>(this->screen_.width);
+			if (projection)
+			{
+				// Head tracking: the game rendered this image from `projection->pose` with `projection->fov`.
+				// Both eyes get the same picture for now (no stereo yet); the runtime re-projects it to where the head is now.
+				for (auto& view : projection_views)
+				{
+					view.pose = projection->pose;
+					view.fov = projection->fov;
+					view.subImage = image;
+				}
 
-			quad.layerFlags = 0; // ignore the game's alpha channel, the screen is opaque
-			quad.space = params.follow_head ? this->view_space_ : this->local_space_;
-			quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-			quad.subImage.swapchain = this->screen_.handle;
-			quad.subImage.imageRect.offset = {0, 0};
-			quad.subImage.imageRect.extent = {static_cast<std::int32_t>(this->screen_.width), static_cast<std::int32_t>(this->screen_.height)};
-			quad.subImage.imageArrayIndex = 0;
-			quad.pose = this->screen_pose(params);
-			quad.size = {params.width, params.width * aspect};
+				projection_layer.layerFlags = 0;
+				projection_layer.space = this->local_space_;
+				projection_layer.viewCount = static_cast<std::uint32_t>(projection_views.size());
+				projection_layer.views = projection_views.data();
+				layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection_layer);
 
-			layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
+				if (this->projected_frames_++ == 0)
+				{
+					log::info("First head-tracked frame shown (fov L{:.1f} R{:.1f} U{:.1f} D{:.1f} degrees)",
+						projection->fov.angleLeft * math::to_degrees, projection->fov.angleRight * math::to_degrees,
+						projection->fov.angleUp * math::to_degrees, projection->fov.angleDown * math::to_degrees);
+				}
+			}
+			else
+			{
+				this->update_anchor(this->frame_state_.predictedDisplayTime);
+
+				const auto aspect = static_cast<float>(this->screen_.height) / static_cast<float>(this->screen_.width);
+
+				quad.layerFlags = 0; // ignore the game's alpha channel, the screen is opaque
+				quad.space = params.follow_head ? this->view_space_ : this->local_space_;
+				quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+				quad.subImage = image;
+				quad.pose = this->screen_pose(params);
+				quad.size = {params.width, params.width * aspect};
+
+				layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
+			}
 		}
 
 		XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
@@ -757,12 +854,12 @@ namespace vr
 
 	std::string xr_runtime::status() const
 	{
-		return std::format("runtime: {} | headset: {} | session: {} | state: {} | frames shown: {} | screen: {}x{} {}",
+		return std::format("runtime: {} | headset: {} | session: {} | state: {} | frames shown: {} ({} head-tracked) | image: {}x{} {}",
 			this->runtime_name_,
 			this->system_name_.empty() ? "not found yet" : this->system_name_,
 			this->session_ != XR_NULL_HANDLE ? (this->session_running_ ? "running" : "created") : "none",
 			to_string(this->session_state_),
-			this->frames_submitted_,
+			this->frames_submitted_, this->projected_frames_,
 			this->screen_.width, this->screen_.height, format_name(this->screen_.format));
 	}
 }
