@@ -101,3 +101,31 @@ jobs:
 
       - name: Publish changes
         run: ssh ${{ secrets.AURORA_MASTER_SSH_USER }}@${{ secrets.AURORA_MASTER_SSH_ADDRESS }} ${{ secrets.AURORA_MASTER_SSH_CHANGE_PUBLISH_COMMAND }}
+
+  publish:
+    # iw7-vr: put the Release exe on an orphan "builds" branch so test builds can be fetched over git
+    name: Publish test build
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.repository != 'auroramod/iw7-mod' && github.event_name == 'push' && github.ref == 'refs/heads/vr'
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download Release binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: Release binaries
+          path: out
+
+      - name: Push to the builds branch
+        working-directory: out
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          xz -9 -T0 iw7-vr.pdb
+          echo "${GITHUB_SHA}" > COMMIT
+          git init -q -b builds
+          git add iw7-vr.exe iw7-vr.pdb.xz COMMIT
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -q -m "iw7-vr build of ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" builds
