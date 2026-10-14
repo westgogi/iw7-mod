@@ -10,6 +10,7 @@
 
 #include "gui.hpp"
 #include "component/directx.hpp"
+#include "component/vr/vr.hpp"
 
 #include <utils/string.hpp>
 #include <utils/hook.hpp>
@@ -434,6 +435,9 @@ namespace gui
 				WaitForSingleObject(mutex, INFINITE);
 				draw_gui(swap_chain);
 				ReleaseMutex(mutex);
+
+				// iw7-vr: hand the finished frame to the headset before the game presents it
+				vr::on_present(swap_chain, mutex);
 			}
 
 			r_present_frame_hook.invoke<void>(a1);

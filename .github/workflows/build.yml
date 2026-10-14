@@ -46,8 +46,8 @@ jobs:
         with:
           name: ${{matrix.configuration}} binaries
           path: |
-            build/bin/x64/${{matrix.configuration}}/iw7-mod.exe
-            build/bin/x64/${{matrix.configuration}}/iw7-mod.pdb
+            build/bin/x64/${{matrix.configuration}}/iw7-vr.exe
+            build/bin/x64/${{matrix.configuration}}/iw7-vr.pdb
             
       - name: Upload ${{matrix.configuration}} data artifacts
         uses: actions/upload-artifact@v7
@@ -59,7 +59,8 @@ jobs:
     name: Deploy artifacts
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    # iw7-vr: deploying needs AuroraMod's server secrets, so only the upstream repository may run it
+    if: github.repository == 'auroramod/iw7-mod' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     steps:
       - name: Setup main environment
         if: github.ref == 'refs/heads/main'

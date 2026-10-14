@@ -319,12 +319,12 @@ namespace updater
 					continue;
 				}
 
-#if GIT_DIRTY == 1
-				if (name == get_binary_name())
+				// iw7-vr: the update server only has the official client; never replace (or add) an exe, or the VR build
+				// would overwrite itself with the flat game. Data files are still updated as normal.
+				if (name == get_binary_name() || std::string_view(name).ends_with(".exe"))
 				{
 					continue;
 				}
-#endif
 
 				if (is_debugging_updater)
 					console::debug("[Updater] Add file \"%s\"\n", name);

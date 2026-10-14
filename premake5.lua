@@ -300,7 +300,8 @@ project "client"
 kind "ConsoleApp"
 language "C++"
 
-targetname "iw7-mod"
+-- iw7-vr: own exe name, so it can sit next to the official iw7-mod.exe and the updater never swaps it out
+targetname "iw7-vr"
 
 pchheader "std_include.hpp"
 pchsource "src/client/std_include.cpp"
