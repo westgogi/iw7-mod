@@ -17,11 +17,12 @@
 //
 // Main thread, once per frame:
 //  1. The input code builds the player's command. Our aim hook samples the headset pose (predicted for when this frame
-//     will be shown) and turns the player by however much the head turned since last frame, and sets the aim pitch to
+//     will be shown), turns the player by however much the head turned since last frame and pulls the aim pitch onto
 //     the head's pitch. Aiming, the crosshair and the gun follow your head; the mouse/stick still turn your body.
-//  2. CG_CalcViewValues builds the camera. Our camera hook then replaces its orientation with body yaw + the full head
-//     rotation (so roll and exact pitch are always right), moves it by the head's position offset, and widens the
-//     field of view to cover both eyes. It records the pose and FOV this frame was rendered with.
+//  2. Once the game has finished its camera for the frame, it hands it to the renderer (game_view::submit_view; both the
+//     single-player and multiplayer frame functions call it). Our hook replaces the camera's orientation with body yaw
+//     + the full head rotation (so roll and exact pitch are always right), moves it by the head's position offset and
+//     widens the field of view to cover both eyes, then records the pose and FOV the frame is rendered with.
 //  3. Before R_EndFrame the record is queued; the render thread pops it when it presents that frame and hands the
 //     image to the headset as a projection layer, so the runtime knows exactly where it was rendered from.
 // Both eyes still get the same image (no stereo yet).
@@ -39,7 +40,7 @@ namespace vr::head_tracking
 		constexpr float max_head_offset = 0.6f; // metres; keeps you from leaning far through walls
 
 		utils::hook::detour aim_adjust_hook;
-		utils::hook::detour cg_calc_view_values_hook;
+		utils::hook::detour submit_view_hook;
 
 		// ---- main thread state ----------------------------------------------------------------------------------------
 
@@ -54,8 +55,8 @@ namespace vr::head_tracking
 		};
 
 		sampled_pose pose{};
-		std::uint64_t frame_number = 0;
-		std::uint64_t sampled_frame = ~0ull;
+		std::uint64_t frame_number = 1;
+		std::uint64_t sampled_frame = 0;
 
 		bool reference_valid = false;
 		float reference_yaw = 0.0f; // radians, OpenXR convention
@@ -65,17 +66,29 @@ namespace vr::head_tracking
 
 		bool aim_baseline_valid = false;
 		float last_aim_yaw = 0.0f;
+		float last_game_pitch = 0.0f; // the game's own view pitch last frame, before our camera override
 
 		std::optional<projection_info> pending_projection;
 		std::uint64_t last_camera_frame = 0;
 		bool camera_logged = false;
 		bool aim_logged = false;
+		std::unordered_set<std::string> reported;
 
-		// ---- shared with the render thread --------------------------------------------------------------------------
+		// ---- shared with the render thread / console ------------------------------------------------------------------
 
 		std::mutex records_mutex;
 		std::deque<frame_record> records;
+		std::atomic<std::uint64_t> view_calls = 0;
 		std::atomic<std::uint64_t> camera_frames = 0;
+		std::atomic<std::uint64_t> aim_calls = 0;
+
+		void report_once(const std::string& message)
+		{
+			if (reported.insert(message).second)
+			{
+				log::warn("{}", message);
+			}
+		}
 
 		bool enabled()
 		{
@@ -85,7 +98,7 @@ namespace vr::head_tracking
 		bool in_game_recently()
 		{
 			// the camera hook ran within the last couple of frames
-			return last_camera_frame + 2 >= frame_number && last_camera_frame != 0;
+			return last_camera_frame != 0 && last_camera_frame + 2 >= frame_number;
 		}
 
 		// Samples the headset once per game frame
@@ -103,6 +116,7 @@ namespace vr::head_tracking
 			const auto frames_ahead = vr_predict_frames ? vr_predict_frames->current.value : 1.0f;
 			if (!locate_predicted(frames_ahead, views))
 			{
+				report_once("Head tracking: couldn't get the headset pose this frame (VR not running yet?)");
 				return false;
 			}
 
@@ -134,6 +148,7 @@ namespace vr::head_tracking
 		std::uint64_t aim_adjust_stub(std::uint8_t* input, float* output)
 		{
 			const auto result = aim_adjust_hook.invoke<std::uint64_t>(input, output);
+			++aim_calls;
 
 			const auto local_client = *reinterpret_cast<int*>(input + game_view::aim_input_local_client);
 			if (local_client != 0 || !enabled() || !vr_head_aim->current.enabled || !in_game_recently() || !sample_pose())
@@ -151,16 +166,13 @@ namespace vr::head_tracking
 			last_aim_yaw = pose.yaw;
 			aim_baseline_valid = true;
 
-			// pitch: the player's view pitch is command pitch + delta_angles, so this puts it exactly on the head's pitch
-			if (auto* cg = game_view::cg(0))
-			{
-				output[0] = math::wrap_degrees(pose.pitch - game_view::player_delta_angles(cg)[0]);
-			}
+			// pitch: pull the player's view pitch onto the head's pitch (corrects whatever the mouse/stick did)
+			output[0] += math::wrap_degrees(pose.pitch - last_game_pitch);
 
 			if (!aim_logged)
 			{
 				aim_logged = true;
-				log::info("Head aim active (head yaw {:.1f}, pitch {:.1f})", pose.yaw, pose.pitch);
+				log::info("Head aim active on thread {} (head yaw {:.1f}, pitch {:.1f})", GetCurrentThreadId(), pose.yaw, pose.pitch);
 			}
 
 			return result;
@@ -185,13 +197,17 @@ namespace vr::head_tracking
 			}
 		}
 
-		void apply_camera(std::uint8_t* cg)
+		void apply_camera(std::uint8_t* refdef)
 		{
-			auto* view = game_view::view(cg);
-			const auto* game_angles = game_view::view_angles(cg);
+			auto* view = game_view::view(refdef);
+
+			// the game's own camera direction this frame
+			const math::vec3 game_forward{view->axis[0][0], view->axis[0][1], view->axis[0][2]};
+			const auto game_yaw = std::atan2(game_forward.y, game_forward.x) * math::to_degrees;
+			last_game_pitch = -std::asin(std::clamp(game_forward.z, -1.0f, 1.0f)) * math::to_degrees;
 
 			// where the body faces in the game: the game's view yaw minus where the head looks
-			const auto body_yaw = game_angles[1] - pose.yaw;
+			const auto body_yaw = game_yaw - pose.yaw;
 
 			math::vec3 axis[3];
 			math::to_game_axis(pose.relative_orientation, axis);
@@ -230,9 +246,8 @@ namespace vr::head_tracking
 			view->tan_half_fov_x = tan_x;
 			view->tan_half_fov_y = tan_y;
 
-			auto* effects_origin = game_view::effects_origin(cg);
-			std::memcpy(effects_origin, view->origin, sizeof(float) * 3);
-			axis_to_angles(axis, game_view::effects_angles(cg));
+			std::memcpy(game_view::effects_origin(refdef), view->origin, sizeof(float) * 3);
+			axis_to_angles(axis, game_view::effects_angles(refdef));
 
 			projection_info projection{};
 			projection.pose = pose.views.head;
@@ -245,30 +260,24 @@ namespace vr::head_tracking
 			if (!camera_logged)
 			{
 				camera_logged = true;
-				log::info("Head-tracked camera active on thread {}: body yaw {:.1f}, head yaw {:.1f} pitch {:.1f}, fov tan {:.3f} x {:.3f}",
-					GetCurrentThreadId(), body_yaw, pose.yaw, pose.pitch, tan_x, tan_y);
+				log::info("Head-tracked camera active on thread {}: game yaw {:.1f} pitch {:.1f}, head yaw {:.1f} pitch {:.1f}, fov tan {:.3f} x {:.3f}",
+					GetCurrentThreadId(), game_yaw, last_game_pitch, pose.yaw, pose.pitch, tan_x, tan_y);
 			}
 		}
 
-		std::uint64_t cg_calc_view_values_stub(const int local_client)
+		void submit_view_stub(const int local_client, std::uint8_t* refdef, std::uint8_t* view, const float z_near,
+			const int a5, const int a6, const char skip)
 		{
-			const auto result = cg_calc_view_values_hook.invoke<std::uint64_t>(local_client);
+			++view_calls;
 
-			if (local_client != 0 || !enabled())
+			if (local_client == 0 && !skip && enabled() && refdef && sample_pose())
 			{
-				return result;
+				last_camera_frame = frame_number;
+				++camera_frames;
+				apply_camera(refdef);
 			}
 
-			auto* cg = game_view::cg(0);
-			if (!cg || !sample_pose())
-			{
-				return result;
-			}
-
-			last_camera_frame = frame_number;
-			++camera_frames;
-			apply_camera(cg);
-			return result;
+			submit_view_hook.invoke<void>(local_client, refdef, view, z_near, a5, a6, skip);
 		}
 
 		// main thread, right before R_EndFrame: queue what this frame was rendered with
@@ -321,11 +330,11 @@ namespace vr::head_tracking
 
 	std::string status()
 	{
-		return std::format("mode: {} | head aim: {} | head position: {} | head-tracked game frames: {}",
+		return std::format("mode: {} | head aim: {} | head position: {} | camera calls: {} | head-tracked frames: {} | aim calls: {}",
 			enabled() ? "head tracking" : "screen only",
 			vr_head_aim && vr_head_aim->current.enabled ? "on" : "off",
 			vr_head_position && vr_head_position->current.enabled ? "on" : "off",
-			camera_frames.load());
+			view_calls.load(), camera_frames.load(), aim_calls.load());
 	}
 
 	class component final : public component_interface
@@ -349,10 +358,26 @@ namespace vr::head_tracking
 			vr_predict_frames = game::Dvar_RegisterFloat("vr_predict_frames", 1.0f, 0.0f, 4.0f, game::DVAR_FLAG_SAVED,
 				"VR: how many frames ahead to predict the head pose");
 
-			aim_adjust_hook.create(game_view::aim_adjust, aim_adjust_stub);
-			cg_calc_view_values_hook.create(game_view::cg_calc_view_values, cg_calc_view_values_stub);
+			aim_adjust_hook.create(game_view::aim_adjust, reinterpret_cast<void*>(aim_adjust_stub));
+			submit_view_hook.create(game_view::submit_view, reinterpret_cast<void*>(submit_view_stub));
 
 			scheduler::loop(end_frame, scheduler::renderer);
+
+			// every 10 s, note in the log if the game is drawing views but none could be head-tracked
+			scheduler::loop([]
+			{
+				static std::uint64_t last_views = 0;
+				static std::uint64_t last_tracked = 0;
+				const auto views = view_calls.load();
+				const auto tracked = camera_frames.load();
+				if (views != last_views && tracked == last_tracked && enabled())
+				{
+					log::warn("Head tracking: the game drew {} views in the last 10 s but none were head-tracked", views - last_views);
+				}
+
+				last_views = views;
+				last_tracked = tracked;
+			}, scheduler::async, 10s);
 		}
 	};
 }

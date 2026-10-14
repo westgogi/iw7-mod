@@ -4,22 +4,18 @@
 // See the "Reverse-engineering notes" in the project plan for how each address was identified.
 namespace vr::game_view
 {
-	// CG_DrawActiveFrame -> CG_CalcViewValues(int localClientNum) builds the camera (cg_s::refdef) every frame
-	constexpr std::uintptr_t cg_calc_view_values = 0x14026B7E0;
+	// Hands the finished camera to the renderer. Both frame functions call it once per frame after the view (and the
+	// viewmodel) is computed and before the sound listener, renderer and effects read it:
+	//   0x14026CB50 (multiplayer CG_DrawActiveFrame) and 0x1402F8150 (single-player CG_DrawActiveFrame).
+	// void (int localClientNum, refdef_t* refdef, RefdefView* view, float zNear, int, int, bool skip)
+	constexpr std::uintptr_t submit_view = 0x140AC28E0;
 
 	// Called by the input code once per user command with the view angles about to be stored in the client state:
 	// (const aim_input* in, aim_output* out); out holds {float pitch, float yaw, ...}
 	constexpr std::uintptr_t aim_adjust = 0x1405BC540;
 	constexpr std::size_t aim_input_local_client = 0x30;
 
-	// CG_GetLocalClientGlobals (0x140242BF0): cg = *(cg_s**)0x141FDBEF0 + localClientNum * 0xFDEA8.
-	// Unlike iw7-mod's game::cg (an encrypted pointer array), this is a plain pointer; it's null outside of a map.
-	inline std::uint8_t* cg(const int local_client)
-	{
-		auto* base = *reinterpret_cast<std::uint8_t**>(0x141FDBEF0);
-		return base ? base + static_cast<std::size_t>(local_client) * 0xFDEA8 : nullptr;
-	}
-
+	// refdef_t lives at cg_s + 0x4B38; RefdefView at refdef + 0x10
 	struct refdef_view
 	{
 		float tan_half_fov_x;
@@ -28,31 +24,19 @@ namespace vr::game_view
 		float axis[3][3]; // forward, left, up
 	};
 
-	inline refdef_view* view(std::uint8_t* cg)
+	inline refdef_view* view(std::uint8_t* refdef)
 	{
-		return reinterpret_cast<refdef_view*>(cg + 0x4B48); // cg_s::refdef (0x4B38) + 0x10
+		return reinterpret_cast<refdef_view*>(refdef + 0x10);
 	}
 
-	// cg_s::refdefViewAngles: pitch, yaw, roll the game computed the camera from
-	inline float* view_angles(std::uint8_t* cg)
+	// copies CG_CalcViewValues makes for the effects camera (cg + 0x49188 origin, cg + 0x49194 angles)
+	inline float* effects_origin(std::uint8_t* refdef)
 	{
-		return reinterpret_cast<float*>(cg + 0x49158);
+		return reinterpret_cast<float*>(refdef + (0x49188 - 0x4B38));
 	}
 
-	// predictedPlayerState (cg + 0x8): delta_angles at +0x80, viewangles at +0x1B8
-	inline float* player_delta_angles(std::uint8_t* cg)
+	inline float* effects_angles(std::uint8_t* refdef)
 	{
-		return reinterpret_cast<float*>(cg + 0x8 + 0x80);
-	}
-
-	// copies CG_CalcViewValues makes for the effects camera: final origin, final angles
-	inline float* effects_origin(std::uint8_t* cg)
-	{
-		return reinterpret_cast<float*>(cg + 0x49188);
-	}
-
-	inline float* effects_angles(std::uint8_t* cg)
-	{
-		return reinterpret_cast<float*>(cg + 0x49194);
+		return reinterpret_cast<float*>(refdef + (0x49194 - 0x4B38));
 	}
 }
