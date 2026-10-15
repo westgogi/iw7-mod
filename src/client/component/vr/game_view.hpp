@@ -23,6 +23,22 @@ namespace vr::game_view
 	// The game ignores the gamepad while it returns false.
 	constexpr std::uintptr_t gamepad_enabled = 0x140337800;
 
+	// Player profiles (one per controller): gamepad options. With gpadEnabled off the game runs "exec buttons_unbind"
+	// for the gamepad, so a pad does nothing even though it is read.
+	constexpr std::uintptr_t profiles = 0x1452456D0;
+	constexpr std::size_t profile_size = 0x20E8;
+	constexpr std::size_t profile_gamepad_enabled = 0xC0; // bool "gpadEnabled"
+
+	// void (int controllerIndex): runs "exec <gpadButtonsConfig>" and "exec <gpadSticksConfig>" for the profile when its
+	// gamepad is enabled, otherwise "exec buttons_unbind" (what the options menu calls after toggling the gamepad)
+	constexpr std::uintptr_t apply_gamepad_bindings = 0x1409C1440;
+
+	// Renderer dvars (pointers to the dvar_t*), for the effects that don't work in VR
+	constexpr std::uintptr_t dvar_r_post_aa = 0x1483E8B58;      // enum None, FXAA, SMAA 1x, Filmic SMAA 1x, SMAA T2x, Filmic SMAA T2x
+	constexpr std::uintptr_t dvar_r_mb_enable = 0x1483E9320;    // enum Off, On (all ents), ... (cheat-protected)
+	constexpr std::uintptr_t dvar_r_mb_enable_a = 0x1483E9328;  // bool, the saved motion blur setting
+	constexpr std::uintptr_t dvar_r_dof_enable = 0x1483E9148;   // bool
+
 	// refdef_t lives at cg_s + 0x4B38; RefdefView at refdef + 0x10
 	struct refdef_view
 	{

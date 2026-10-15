@@ -47,6 +47,8 @@ namespace vr::head_tracking
 		game::dvar_t* vr_world_scale = nullptr;
 		game::dvar_t* vr_predict_frames = nullptr;
 		game::dvar_t* vr_aim_lag = nullptr;
+		game::dvar_t* vr_stereo = nullptr;
+		game::dvar_t* vr_postfx = nullptr;
 
 		constexpr float max_head_offset = 0.6f; // metres; keeps you from leaning far through walls
 
@@ -83,6 +85,9 @@ namespace vr::head_tracking
 
 		std::optional<projection_info> pending_projection;
 		std::uint64_t last_camera_frame = 0;
+		std::uint64_t stereo_frames = 0;    // head-tracked frames drawn with stereo on; picks the eye
+		bool gameplay_was_active = false;
+		std::int64_t gameplay_since = 0;    // steady clock ms when head-tracked gameplay last started
 		bool camera_logged = false;
 		bool aim_logged = false;
 		std::unordered_set<std::string> reported;
@@ -427,8 +432,14 @@ namespace vr::head_tracking
 			// the head's rotation is applied relative to this heading
 			const auto body_yaw = camera_yaw - pose.yaw;
 
+			// Stereo (alternate-eye rendering): every other frame is drawn from the left eye, the rest from the right eye,
+			// each from that eye's own position, so near objects look right to each eye instead of from between them
+			const auto eye = vr_stereo->current.enabled ? static_cast<int>(stereo_frames++ % 2) : -1;
+			const auto& rendered_pose = eye >= 0 ? pose.views.eye_pose[eye] : pose.views.head;
+			const auto unyaw = math::yaw_rotation(-reference_yaw);
+
 			math::vec3 axis[3];
-			math::to_game_axis(pose.relative_orientation, axis);
+			math::to_game_axis(eye >= 0 ? math::multiply(unyaw, rendered_pose.orientation) : pose.relative_orientation, axis);
 			for (auto i = 0; i < 3; ++i)
 			{
 				axis[i] = math::rotate_yaw(axis[i], body_yaw);
@@ -437,20 +448,27 @@ namespace vr::head_tracking
 				view->axis[i][2] = axis[i].z;
 			}
 
+			// position: the head's movement (limited, so you can't lean far through walls) plus this eye's offset from it
+			XrVector3f offset{};
 			if (vr_head_position->current.enabled)
 			{
-				auto offset = pose.relative_position;
+				offset = pose.relative_position;
 				const auto length = std::sqrt(offset.x * offset.x + offset.y * offset.y + offset.z * offset.z);
 				if (length > max_head_offset)
 				{
 					offset = math::scale(offset, max_head_offset / length);
 				}
-
-				const auto moved = math::rotate_yaw(math::to_game(math::scale(offset, vr_world_scale->current.value)), body_yaw);
-				view->origin[0] += moved.x;
-				view->origin[1] += moved.y;
-				view->origin[2] += moved.z;
 			}
+
+			if (eye >= 0)
+			{
+				offset = math::add(offset, math::rotate(unyaw, math::subtract(rendered_pose.position, pose.views.head.position)));
+			}
+
+			const auto moved = math::rotate_yaw(math::to_game(math::scale(offset, vr_world_scale->current.value)), body_yaw);
+			view->origin[0] += moved.x;
+			view->origin[1] += moved.y;
+			view->origin[2] += moved.z;
 
 			// one symmetric frustum that covers both eyes; the runtime is told exactly this FOV
 			auto tan_x = 0.0f;
@@ -477,7 +495,8 @@ namespace vr::head_tracking
 			axis_to_angles(axis, game_view::effects_angles(refdef));
 
 			projection_info projection{};
-			projection.pose = pose.views.head;
+			projection.pose = rendered_pose;
+			projection.eye = eye;
 			projection.fov.angleLeft = -std::atan(tan_x);
 			projection.fov.angleRight = std::atan(tan_x);
 			projection.fov.angleUp = std::atan(tan_y);
@@ -611,6 +630,71 @@ namespace vr::head_tracking
 			}
 		}
 
+		// ---- effects that don't work in VR ------------------------------------------------------------------------
+		// Motion blur and depth of field blur the image in ways your eyes don't, and temporal anti-aliasing blends each
+		// frame with the previous one, which with alternating eyes is the other eye's picture. While head tracking is on
+		// (and vr_postfx is 1) they are switched off; the old values come back when either is turned off.
+
+		struct dvar_override
+		{
+			std::uintptr_t pointer;
+			const char* what;
+			const char* vr_value;
+			bool (*needs_change)(const game::dvar_t*);
+			std::string original{};
+			bool changed = false;
+		};
+
+		std::array<dvar_override, 4> postfx_overrides{{
+			{game_view::dvar_r_mb_enable_a, "motion blur (saved setting)", "0", [](const game::dvar_t* d) { return d->current.enabled; }},
+			{game_view::dvar_r_mb_enable, "motion blur", "Off", [](const game::dvar_t* d) { return d->current.integer != 0; }},
+			{game_view::dvar_r_dof_enable, "depth of field", "0", [](const game::dvar_t* d) { return d->current.enabled; }},
+			{game_view::dvar_r_post_aa, "temporal anti-aliasing", "SMAA 1x", [](const game::dvar_t* d) { return d->current.integer >= 3; }},
+		}};
+
+		bool postfx_applied = false;
+
+		void update_postfx()
+		{
+			const auto want = enabled() && vr_postfx && vr_postfx->current.enabled && has_run();
+			if (want == postfx_applied)
+			{
+				return;
+			}
+
+			postfx_applied = want;
+			std::string changes;
+
+			for (auto& entry : postfx_overrides)
+			{
+				auto* dvar = *reinterpret_cast<game::dvar_t**>(entry.pointer);
+				if (!dvar)
+				{
+					continue;
+				}
+
+				if (want && entry.needs_change(dvar))
+				{
+					entry.original = game::Dvar_ValueToString(dvar, dvar->current);
+					game::Dvar_SetFromStringFromSource(dvar, entry.vr_value, game::DVAR_SOURCE_INTERNAL);
+					entry.changed = true;
+					changes += std::format("{} ({} -> {}), ", entry.what, entry.original, entry.vr_value);
+				}
+				else if (!want && entry.changed)
+				{
+					game::Dvar_SetFromStringFromSource(dvar, entry.original.data(), game::DVAR_SOURCE_INTERNAL);
+					entry.changed = false;
+					changes += std::format("{} (back to {}), ", entry.what, entry.original);
+				}
+			}
+
+			if (!changes.empty())
+			{
+				changes.resize(changes.size() - 2);
+				log::info("{} for VR: {}", want ? "Turned off" : "Restored", changes);
+			}
+		}
+
 		// main thread, right before R_EndFrame: queue what this frame was rendered with
 		void end_frame()
 		{
@@ -631,7 +715,16 @@ namespace vr::head_tracking
 				}
 			}
 
-			input::set_gameplay_active(enabled() && in_game_recently());
+			const auto active = enabled() && in_game_recently();
+			if (active && !gameplay_was_active)
+			{
+				gameplay_since = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count();
+			}
+
+			gameplay_was_active = active;
+			input::set_gameplay_active(active);
+			update_postfx();
 			++frame_number;
 		}
 	}
@@ -660,10 +753,21 @@ namespace vr::head_tracking
 		recenter_requested = true;
 	}
 
+	bool gameplay_active()
+	{
+		return gameplay_was_active;
+	}
+
+	std::int64_t gameplay_since_ms()
+	{
+		return gameplay_was_active ? gameplay_since : 0;
+	}
+
 	std::string status()
 	{
-		return std::format("mode: {} | head aim: {} | head position: {} | camera calls: {} | head-tracked frames: {} | aim calls: {} | aim timing: {}",
+		return std::format("mode: {}{} | head aim: {} | head position: {} | camera calls: {} | head-tracked frames: {} | aim calls: {} | aim timing: {}",
 			enabled() ? "head tracking" : "screen only",
+			enabled() ? (vr_stereo && vr_stereo->current.enabled ? ", stereo (alternating eyes)" : ", mono") : "",
 			vr_head_aim && vr_head_aim->current.enabled ? "on" : "off",
 			vr_head_position && vr_head_position->current.enabled ? "on" : "off",
 			view_calls.load(), camera_frames.load(), aim_calls.load(), aim_lag.describe());
@@ -691,6 +795,10 @@ namespace vr::head_tracking
 				"VR: how many frames ahead to predict the head pose");
 			vr_aim_lag = game::Dvar_RegisterInt("vr_aim_lag", -1, -1, 2, game::DVAR_FLAG_NONE,
 				"VR: frames between feeding the game a head turn and its view showing it. -1 = measure automatically");
+			vr_stereo = game::Dvar_RegisterBool("vr_stereo", true, game::DVAR_FLAG_SAVED,
+				"VR: 3D. Each frame is drawn from one eye, alternating left and right. 0 = both eyes see the same picture");
+			vr_postfx = game::Dvar_RegisterBool("vr_postfx", true, game::DVAR_FLAG_SAVED,
+				"VR: switch off motion blur, depth of field and temporal anti-aliasing while head tracking is on");
 
 			aim_adjust_hook.create(game_view::aim_adjust, reinterpret_cast<void*>(aim_adjust_stub));
 			submit_view_hook.create(game_view::submit_view, reinterpret_cast<void*>(submit_view_stub));

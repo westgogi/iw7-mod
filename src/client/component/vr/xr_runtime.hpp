@@ -11,6 +11,8 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <array>
+
 namespace vr
 {
 	namespace input
@@ -60,6 +62,7 @@ namespace vr
 	{
 		XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}}; // LOCAL space
 		XrFovf fov{};
+		int eye = -1; // 0 = left, 1 = right (alternate-eye stereo), -1 = the same picture for both eyes
 	};
 
 	const char* to_string(XrResult result);
@@ -124,7 +127,8 @@ namespace vr
 		void request_refresh_rate(float hz);
 
 	private:
-		struct screen_swapchain
+		// The game's picture goes into images_[0] (virtual screen, left eye or both eyes) or images_[1] (right eye)
+		struct image_swapchain
 		{
 			XrSwapchain handle = XR_NULL_HANDLE;
 			std::vector<ID3D11Texture2D*> images;
@@ -152,7 +156,19 @@ namespace vr
 		XrEnvironmentBlendMode blend_mode_ = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
 		std::vector<std::int64_t> swapchain_formats_;
-		screen_swapchain screen_;
+		std::array<image_swapchain, 2> images_{};
+
+		// what each eye shows: the latest picture rendered for it and the pose/FOV it was rendered with
+		struct eye_view
+		{
+			bool valid = false;
+			int image = 0;
+			XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+			XrFovf fov{};
+		};
+
+		std::array<eye_view, 2> eye_views_{};
+		bool stereo_logged_ = false;
 
 		XrPosef anchor_{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 		bool recenter_requested_ = true;
@@ -205,9 +221,9 @@ namespace vr
 		void pick_blend_mode();
 		bool handle_state_change(XrSessionState state);
 
-		bool ensure_screen_swapchain(const D3D11_TEXTURE2D_DESC& source, bool srgb);
-		void destroy_screen_swapchain();
-		bool copy_to_screen(ID3D11DeviceContext* context, ID3D11Texture2D* source, bool srgb);
+		bool ensure_image_swapchain(const D3D11_TEXTURE2D_DESC& source, bool srgb, int index);
+		void destroy_image_swapchain(int index);
+		bool copy_to_image(ID3D11DeviceContext* context, ID3D11Texture2D* source, bool srgb, int index);
 		void update_anchor(XrTime time);
 		XrPosef screen_pose(const screen_params& params) const;
 

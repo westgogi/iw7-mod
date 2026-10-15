@@ -19,4 +19,8 @@ namespace vr::head_tracking
 
 	// Text for vr_status
 	std::string status();
+
+	// main thread: head-tracked gameplay is on screen, and since when (steady clock ms, 0 = not active)
+	bool gameplay_active();
+	std::int64_t gameplay_since_ms();
 }

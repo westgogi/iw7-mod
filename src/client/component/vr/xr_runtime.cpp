@@ -246,7 +246,8 @@ namespace vr
 
 	xr_runtime::~xr_runtime()
 	{
-		this->destroy_screen_swapchain();
+		this->destroy_image_swapchain(1);
+		this->destroy_image_swapchain(0);
 
 		if (this->view_space_ != XR_NULL_HANDLE)
 		{
@@ -641,23 +642,48 @@ namespace vr
 		std::array<XrCompositionLayerBaseHeader*, 1> layers{};
 		std::uint32_t layer_count = 0;
 
-		if (this->frame_state_.shouldRender && source && this->copy_to_screen(context, source, params.srgb))
+		const auto sub_image = [this](const int index)
 		{
+			const auto& target = this->images_[index];
 			XrSwapchainSubImage image{};
-			image.swapchain = this->screen_.handle;
+			image.swapchain = target.handle;
 			image.imageRect.offset = {0, 0};
-			image.imageRect.extent = {static_cast<std::int32_t>(this->screen_.width), static_cast<std::int32_t>(this->screen_.height)};
+			image.imageRect.extent = {static_cast<std::int32_t>(target.width), static_cast<std::int32_t>(target.height)};
 			image.imageArrayIndex = 0;
+			return image;
+		};
 
-			if (projection)
+		if (this->frame_state_.shouldRender && source && projection)
+		{
+			// Head tracking. With stereo the game draws one eye per frame (alternate-eye rendering): this frame's image
+			// replaces that eye's picture and the other eye keeps the one from the previous frame. Each picture is shown
+			// from exactly the pose it was rendered from; the runtime re-projects both to where the eyes are now.
+			const auto eye = projection->eye;
+			const auto image_index = eye == 1 ? 1 : 0;
+			if (this->copy_to_image(context, source, params.srgb, image_index))
 			{
-				// Head tracking: the game rendered this image from `projection->pose` with `projection->fov`.
-				// Both eyes get the same picture for now (no stereo yet); the runtime re-projects it to where the head is now.
-				for (auto& view : projection_views)
+				const eye_view rendered{true, image_index, projection->pose, projection->fov};
+				if (eye < 0)
 				{
-					view.pose = projection->pose;
-					view.fov = projection->fov;
-					view.subImage = image;
+					this->eye_views_ = {rendered, rendered};
+				}
+				else
+				{
+					this->eye_views_[eye] = rendered;
+					if (!this->eye_views_[1 - eye].valid)
+					{
+						this->eye_views_[1 - eye] = rendered; // until the other eye has its own picture
+					}
+				}
+			}
+
+			if (this->eye_views_[0].valid && this->eye_views_[1].valid)
+			{
+				for (auto i = 0; i < 2; ++i)
+				{
+					projection_views[i].pose = this->eye_views_[i].pose;
+					projection_views[i].fov = this->eye_views_[i].fov;
+					projection_views[i].subImage = sub_image(this->eye_views_[i].image);
 				}
 
 				projection_layer.layerFlags = 0;
@@ -668,26 +694,35 @@ namespace vr
 
 				if (this->projected_frames_++ == 0)
 				{
-					log::info("First head-tracked frame shown (fov L{:.1f} R{:.1f} U{:.1f} D{:.1f} degrees)",
+					log::info("First head-tracked frame shown ({}, fov L{:.1f} R{:.1f} U{:.1f} D{:.1f} degrees)",
+						eye < 0 ? "mono" : "stereo, alternating eyes",
 						projection->fov.angleLeft * math::to_degrees, projection->fov.angleRight * math::to_degrees,
 						projection->fov.angleUp * math::to_degrees, projection->fov.angleDown * math::to_degrees);
 				}
+
+				if (eye >= 0 && !this->stereo_logged_ && this->eye_views_[0].image != this->eye_views_[1].image)
+				{
+					this->stereo_logged_ = true;
+					log::info("Stereo: both eyes now have their own picture");
+				}
 			}
-			else
-			{
-				this->update_anchor(this->frame_state_.predictedDisplayTime);
+		}
+		else if (this->frame_state_.shouldRender && source && this->copy_to_image(context, source, params.srgb, 0))
+		{
+			// virtual screen; head-tracked pictures from before are stale now
+			this->eye_views_ = {};
+			this->update_anchor(this->frame_state_.predictedDisplayTime);
 
-				const auto aspect = static_cast<float>(this->screen_.height) / static_cast<float>(this->screen_.width);
+			const auto aspect = static_cast<float>(this->images_[0].height) / static_cast<float>(this->images_[0].width);
 
-				quad.layerFlags = 0; // ignore the game's alpha channel, the screen is opaque
-				quad.space = params.follow_head ? this->view_space_ : this->local_space_;
-				quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-				quad.subImage = image;
-				quad.pose = this->screen_pose(params);
-				quad.size = {params.width, params.width * aspect};
+			quad.layerFlags = 0; // ignore the game's alpha channel, the screen is opaque
+			quad.space = params.follow_head ? this->view_space_ : this->local_space_;
+			quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			quad.subImage = sub_image(0);
+			quad.pose = this->screen_pose(params);
+			quad.size = {params.width, params.width * aspect};
 
-				layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
-			}
+			layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
 		}
 
 		XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
@@ -709,16 +744,17 @@ namespace vr
 		}
 	}
 
-	bool xr_runtime::ensure_screen_swapchain(const D3D11_TEXTURE2D_DESC& source, const bool srgb)
+	bool xr_runtime::ensure_image_swapchain(const D3D11_TEXTURE2D_DESC& source, const bool srgb, const int index)
 	{
-		if (this->screen_.handle != XR_NULL_HANDLE
-			&& this->screen_.width == source.Width && this->screen_.height == source.Height
-			&& this->screen_.source_format == source.Format && this->screen_.srgb == srgb)
+		auto& target = this->images_[index];
+		if (target.handle != XR_NULL_HANDLE
+			&& target.width == source.Width && target.height == source.Height
+			&& target.source_format == source.Format && target.srgb == srgb)
 		{
 			return true;
 		}
 
-		this->destroy_screen_swapchain();
+		this->destroy_image_swapchain(index);
 
 		auto format = DXGI_FORMAT_UNKNOWN;
 		for (const auto candidate : screen_format_candidates(source.Format, srgb))
@@ -747,70 +783,82 @@ namespace vr
 		create_info.arraySize = 1;
 		create_info.mipCount = 1;
 
-		auto result = xrCreateSwapchain(this->session_, &create_info, &this->screen_.handle);
+		auto result = xrCreateSwapchain(this->session_, &create_info, &target.handle);
 		if (XR_FAILED(result))
 		{
-			this->report_once(std::format("xrCreateSwapchain for the virtual screen failed: {}", to_string(result)));
-			this->screen_.handle = XR_NULL_HANDLE;
+			this->report_once(std::format("xrCreateSwapchain failed: {}", to_string(result)));
+			target.handle = XR_NULL_HANDLE;
 			return false;
 		}
 
 		std::uint32_t count = 0;
-		result = xrEnumerateSwapchainImages(this->screen_.handle, 0, &count, nullptr);
+		result = xrEnumerateSwapchainImages(target.handle, 0, &count, nullptr);
 
 		std::vector<XrSwapchainImageD3D11KHR> images(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
 		if (XR_SUCCEEDED(result))
 		{
-			result = xrEnumerateSwapchainImages(this->screen_.handle, count, &count,
+			result = xrEnumerateSwapchainImages(target.handle, count, &count,
 				reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data()));
 		}
 
 		if (XR_FAILED(result) || count == 0)
 		{
 			this->report_once(std::format("xrEnumerateSwapchainImages failed: {}", to_string(result)));
-			this->destroy_screen_swapchain();
+			this->destroy_image_swapchain(index);
 			return false;
 		}
 
 		for (const auto& image : images)
 		{
-			this->screen_.images.push_back(image.texture);
+			target.images.push_back(image.texture);
 		}
 
-		this->screen_.width = source.Width;
-		this->screen_.height = source.Height;
-		this->screen_.source_format = source.Format;
-		this->screen_.format = format;
-		this->screen_.srgb = srgb;
+		target.width = source.Width;
+		target.height = source.Height;
+		target.source_format = source.Format;
+		target.format = format;
+		target.srgb = srgb;
 
-		log::info("Virtual screen: {}x{}, game image {} ({} samples) -> headset {} ({} images)",
+		log::info("Headset image {}: {}x{}, game image {} ({} samples) -> {} ({} images)", index,
 			source.Width, source.Height, format_name(source.Format), source.SampleDesc.Count, format_name(format), count);
 		return true;
 	}
 
-	void xr_runtime::destroy_screen_swapchain()
+	void xr_runtime::destroy_image_swapchain(const int index)
 	{
-		if (this->screen_.handle != XR_NULL_HANDLE)
+		auto& target = this->images_[index];
+		if (target.handle != XR_NULL_HANDLE)
 		{
-			xrDestroySwapchain(this->screen_.handle);
+			xrDestroySwapchain(target.handle);
 		}
 
-		this->screen_ = {};
+		target = {};
+
+		// an eye still showing this swapchain's picture has nothing to show any more
+		for (auto& view : this->eye_views_)
+		{
+			if (view.image == index)
+			{
+				view.valid = false;
+			}
+		}
 	}
 
-	bool xr_runtime::copy_to_screen(ID3D11DeviceContext* context, ID3D11Texture2D* source, const bool srgb)
+	bool xr_runtime::copy_to_image(ID3D11DeviceContext* context, ID3D11Texture2D* source, const bool srgb, const int index)
 	{
 		D3D11_TEXTURE2D_DESC desc{};
 		source->GetDesc(&desc);
 
-		if (!this->ensure_screen_swapchain(desc, srgb))
+		if (!this->ensure_image_swapchain(desc, srgb, index))
 		{
 			return false;
 		}
 
-		std::uint32_t index = 0;
+		auto& target = this->images_[index];
+
+		std::uint32_t image_index = 0;
 		XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-		auto result = xrAcquireSwapchainImage(this->screen_.handle, &acquire_info, &index);
+		auto result = xrAcquireSwapchainImage(target.handle, &acquire_info, &image_index);
 		if (XR_FAILED(result))
 		{
 			this->report_once(std::format("xrAcquireSwapchainImage failed: {}", to_string(result)));
@@ -819,25 +867,25 @@ namespace vr
 
 		XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 		wait_info.timeout = XR_INFINITE_DURATION;
-		result = xrWaitSwapchainImage(this->screen_.handle, &wait_info);
+		result = xrWaitSwapchainImage(target.handle, &wait_info);
 		if (XR_FAILED(result))
 		{
 			this->report_once(std::format("xrWaitSwapchainImage failed: {}", to_string(result)));
 			return false;
 		}
 
-		auto* target = this->screen_.images[index];
+		auto* texture = target.images[image_index];
 		if (desc.SampleDesc.Count > 1)
 		{
-			context->ResolveSubresource(target, 0, source, 0, this->screen_.format);
+			context->ResolveSubresource(texture, 0, source, 0, target.format);
 		}
 		else
 		{
-			context->CopyResource(target, source);
+			context->CopyResource(texture, source);
 		}
 
 		XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-		result = xrReleaseSwapchainImage(this->screen_.handle, &release_info);
+		result = xrReleaseSwapchainImage(target.handle, &release_info);
 		if (XR_FAILED(result))
 		{
 			this->report_once(std::format("xrReleaseSwapchainImage failed: {}", to_string(result)));
@@ -1418,7 +1466,7 @@ namespace vr
 			this->session_ != XR_NULL_HANDLE ? (this->session_running_ ? "running" : "created") : "none",
 			to_string(this->session_state_),
 			this->frames_submitted_, this->projected_frames_,
-			this->screen_.width, this->screen_.height, format_name(this->screen_.format),
+			this->images_[0].width, this->images_[0].height, format_name(this->images_[0].format),
 			this->actions_attached_ ? std::to_string(this->input_syncs_) : std::string("unavailable"));
 	}
 }

@@ -9,8 +9,8 @@ The build output is `iw7-vr.exe`, so it can live next to the official `iw7-mod.e
 | Milestone | State |
 |---|---|
 | 1. Virtual screen: the game on a big screen in the headset | working |
-| 2. Head-tracked camera | in testing (FOV fix + aim timing in the latest build) |
-| 3. Stereo 3D | planned |
+| 2. Head-tracked camera | working (FOV verified by the projection probe; aim timing 0 frames) |
+| 3. Stereo 3D | alternate-eye rendering in testing (`vr_stereo`) |
 | 4. Motion controls and controller-aimed weapons | controllers as a gamepad + smooth/snap turn in testing; aiming planned |
 | 5. Menus, HUD and cutscenes in VR | planned |
 | 6. Comfort options, Jackal cockpit, polish | planned |
@@ -40,6 +40,8 @@ Logs are written to `iw7-vr.log` next to the exe; the previous run is kept as `i
 | `vr_stick_pitch` | let the right stick look up/down too |
 | `vr_rumble` | controller vibration strength |
 | `vr_refresh_rate` | ask the headset for a refresh rate (Hz), 0 = unchanged |
+| `vr_stereo` | 3D by alternate-eye rendering (each frame draws one eye); 0 = both eyes see the same picture |
+| `vr_postfx` | switch off motion blur, depth of field and temporal AA while head tracking is on |
 | `vr_aim_lag` | developer: frames before the game shows an aim change, -1 = measure |
 | `vr_dump_game` | developer: writes the decrypted game image to `iw7_ship.dump.exe` for analysis |
 | `-novr` | launch flag that starts with VR off |

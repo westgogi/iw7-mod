@@ -5,6 +5,8 @@
 #include "game_view.hpp"
 #include "vr_log.hpp"
 
+#include "component/scheduler.hpp"
+
 #include "game/game.hpp"
 
 #include <utils/hook.hpp>
@@ -267,6 +269,35 @@ namespace vr::input
 			return ERROR_SUCCESS;
 		}
 
+		// The game only binds the gamepad's buttons and sticks while the profile's gamepad option is on; otherwise it runs
+		// "exec buttons_unbind" and a pad does nothing. Once the Touch controllers are in use, switch the option on (as the
+		// options menu would) and load the profile's gamepad layout. Main thread.
+		void ensure_gamepad_option()
+		{
+			static auto times_switched = 0;
+
+			if (!virtual_pad_active())
+			{
+				return;
+			}
+
+			auto* profile = reinterpret_cast<std::uint8_t*>(game_view::profiles); // controller 0
+			auto& gamepad_enabled = profile[game_view::profile_gamepad_enabled];
+			if (gamepad_enabled)
+			{
+				return;
+			}
+
+			gamepad_enabled = 1;
+			utils::hook::invoke<void>(game_view::apply_gamepad_bindings, 0);
+
+			if (++times_switched <= 3)
+			{
+				log::info("Switched the game's gamepad option on and loaded its gamepad controls, for the VR controllers{}",
+					times_switched > 1 ? " (again: the profile had been reloaded)" : "");
+			}
+		}
+
 		// The PC profile can switch the gamepad off ("gpadEnabled"); while the Touch controllers are in use, treat it as on
 		std::uint32_t gamepad_enabled_stub(const int controller_index)
 		{
@@ -360,7 +391,7 @@ namespace vr::input
 		}
 
 		const auto amount = (magnitude - dead_zone) / (1.0f - dead_zone);
-		const auto speed = vr_turn_speed ? vr_turn_speed->current.value : 135.0f;
+		const auto speed = vr_turn_speed ? vr_turn_speed->current.value : 180.0f;
 		return (x > 0.0f ? -amount : amount) * speed * dt;
 	}
 
@@ -417,7 +448,7 @@ namespace vr::input
 				"VR: use the VR controllers as a gamepad");
 			vr_turn_mode = game::Dvar_RegisterInt("vr_turn_mode", 1, 0, 2, game::DVAR_FLAG_SAVED,
 				"VR: right stick turning. 0 = the game's own stick look, 1 = smooth turn, 2 = snap turn");
-			vr_turn_speed = game::Dvar_RegisterFloat("vr_turn_speed", 135.0f, 10.0f, 720.0f, game::DVAR_FLAG_SAVED,
+			vr_turn_speed = game::Dvar_RegisterFloat("vr_turn_speed", 180.0f, 10.0f, 720.0f, game::DVAR_FLAG_SAVED,
 				"VR: smooth turn speed at full stick, degrees per second");
 			vr_snap_angle = game::Dvar_RegisterFloat("vr_snap_angle", 45.0f, 5.0f, 180.0f, game::DVAR_FLAG_SAVED,
 				"VR: snap turn step, degrees");
@@ -427,6 +458,7 @@ namespace vr::input
 				"VR: controller vibration strength, 0 = off");
 
 			gamepad_enabled_hook.create(game_view::gamepad_enabled, reinterpret_cast<void*>(gamepad_enabled_stub));
+			scheduler::loop(ensure_gamepad_option, scheduler::main, 250ms);
 		}
 	};
 }

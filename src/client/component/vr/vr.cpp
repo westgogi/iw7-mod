@@ -9,6 +9,7 @@
 
 #include "component/command.hpp"
 #include "component/directx.hpp"
+#include "component/scheduler.hpp"
 #include "component/console/console.hpp"
 
 #include "game/game.hpp"
@@ -127,6 +128,7 @@ namespace vr
 		}
 
 		std::atomic_bool vr_disabled = false;
+		std::atomic_bool session_has_run = false;
 		std::atomic_bool restart_requested = false;
 		std::atomic_bool recenter_requested = false;
 
@@ -282,6 +284,7 @@ namespace vr
 				return;
 			}
 
+			console::info("[VR] IW7-VR %s\n", GIT_DESCRIBE);
 			if (runtime)
 			{
 				console::info("[VR] %s\n", runtime->status().data());
@@ -365,6 +368,59 @@ namespace vr
 		}
 	}
 
+	namespace
+	{
+		// "IW7-VR <build>" on screen, so it's easy to check which build is running: top right on the virtual screen, and
+		// for the first 10 s of head-tracked play up in the middle of the view (the corners are out of sight there).
+		// Main thread (renderer pipeline, before R_EndFrame).
+		void draw_version()
+		{
+			const auto* placement = game::ScrPlace_GetViewPlacement();
+			if (!placement)
+			{
+				return;
+			}
+
+			const auto width = placement->realViewportSize[0];
+			const auto height = placement->realViewportSize[1];
+			if (width <= 0.0f || height <= 0.0f)
+			{
+				return;
+			}
+
+			auto* font = game::R_RegisterFont("fonts/fira_mono_regular.ttf", 24);
+			if (!font)
+			{
+				return;
+			}
+
+			static constexpr auto text = "IW7-VR " GIT_DESCRIBE;
+			const auto text_width = static_cast<float>(game::R_TextWidth(text, std::numeric_limits<int>::max(), font));
+
+			float x;
+			float y;
+			if (head_tracking::gameplay_active())
+			{
+				const auto since = head_tracking::gameplay_since_ms();
+				if (since == 0 || now_ms() - since > 10'000)
+				{
+					return;
+				}
+
+				x = (width - text_width) * 0.5f;
+				y = height * 0.32f;
+			}
+			else
+			{
+				x = width - text_width - 24.0f;
+				y = 24.0f + static_cast<float>(font->pixelHeight);
+			}
+
+			float color[4]{1.0f, 1.0f, 1.0f, 0.6f};
+			game::R_AddCmdDrawText(text, std::numeric_limits<int>::max(), font, x, y, 1.0f, 1.0f, 0.0f, color, 0);
+		}
+	}
+
 	bool locate_predicted(const float frames_ahead, view_state& out)
 	{
 		std::lock_guard _(pose_mutex);
@@ -374,6 +430,11 @@ namespace vr
 		}
 
 		return runtime->locate(runtime->predicted_time(frames_ahead), out);
+	}
+
+	bool has_run()
+	{
+		return session_has_run && !vr_disabled;
 	}
 
 	std::uint32_t space_change_count()
@@ -451,6 +512,8 @@ namespace vr
 		{
 			return;
 		}
+
+		session_has_run = true;
 
 		runtime->sync_input(controllers.state);
 		{
@@ -544,6 +607,8 @@ namespace vr
 			{
 				print_status();
 			});
+
+			scheduler::loop(draw_version, scheduler::renderer);
 		}
 
 		void pre_destroy() override
