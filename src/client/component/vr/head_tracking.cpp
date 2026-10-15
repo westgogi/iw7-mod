@@ -510,6 +510,8 @@ namespace vr::head_tracking
 			projection_info projection{};
 			projection.pose = rendered_pose;
 			projection.eye = shown_eye;
+			projection.eye_fov[0] = pose.views.eye_fov[0];
+			projection.eye_fov[1] = pose.views.eye_fov[1];
 			projection.fov.angleLeft = -std::atan(tan_x);
 			projection.fov.angleRight = std::atan(tan_x);
 			projection.fov.angleUp = std::atan(tan_y);

@@ -61,8 +61,9 @@ namespace vr
 	struct projection_info
 	{
 		XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}}; // LOCAL space
-		XrFovf fov{};
-		int eye = -1; // 0 = left, 1 = right (alternate-eye stereo), -1 = the same picture for both eyes
+		XrFovf fov{};        // what the picture was rendered with: symmetric, covering both eyes
+		XrFovf eye_fov[2]{}; // each eye's own (asymmetric) field of view at the time
+		int eye = -1;        // 0 = left, 1 = right (alternate-eye stereo), -1 = the same picture for both eyes
 	};
 
 	const char* to_string(XrResult result);
@@ -166,8 +167,11 @@ namespace vr
 			bool valid = false;
 			int image = 0;
 			XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
-			XrFovf fov{};
+			XrFovf rendered_fov{}; // the picture's symmetric FOV
+			XrFovf eye_fov{};      // the part of it this eye shows
 		};
+
+		bool crop_logged_ = false;
 
 		std::array<eye_view, 2> eye_views_{};
 		bool stereo_logged_ = false;

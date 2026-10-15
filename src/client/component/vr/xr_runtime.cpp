@@ -89,6 +89,55 @@ namespace vr
 			}
 		}
 
+		// The game can only render a symmetric frustum, so each picture covers both eyes' fields of view. Each eye is
+		// sent just the rectangle of that picture it can see, with that rectangle's exact FOV, i.e. the eye's own
+		// asymmetric FOV. (Sending the whole symmetric picture with its symmetric FOV made the headset place each eye's
+		// picture off-centre: far-away things were shifted outwards in each eye.)
+		struct eye_crop
+		{
+			XrRect2Di rect{};
+			XrFovf fov{};
+		};
+
+		eye_crop crop_for_eye(const XrFovf& rendered, const XrFovf& eye, const std::uint32_t width, const std::uint32_t height)
+		{
+			eye_crop crop{};
+			crop.rect = {{0, 0}, {static_cast<std::int32_t>(width), static_cast<std::int32_t>(height)}};
+			crop.fov = rendered;
+
+			const auto tx = std::tan(rendered.angleRight); // symmetric: angleLeft == -angleRight
+			const auto ty = std::tan(rendered.angleUp);
+			if (width == 0 || height == 0 || tx <= 0.0f || ty <= 0.0f || eye.angleRight <= eye.angleLeft || eye.angleUp <= eye.angleDown)
+			{
+				return crop;
+			}
+
+			const auto left = std::clamp(std::tan(eye.angleLeft), -tx, tx);
+			const auto right = std::clamp(std::tan(eye.angleRight), -tx, tx);
+			const auto up = std::clamp(std::tan(eye.angleUp), -ty, ty);
+			const auto down = std::clamp(std::tan(eye.angleDown), -ty, ty);
+
+			const auto w = static_cast<float>(width);
+			const auto h = static_cast<float>(height);
+			auto x0 = static_cast<std::int32_t>(std::floor((left / tx + 1.0f) * 0.5f * w));
+			auto x1 = static_cast<std::int32_t>(std::ceil((right / tx + 1.0f) * 0.5f * w));
+			auto y0 = static_cast<std::int32_t>(std::floor((1.0f - up / ty) * 0.5f * h));
+			auto y1 = static_cast<std::int32_t>(std::ceil((1.0f - down / ty) * 0.5f * h));
+			x0 = std::clamp(x0, 0, static_cast<std::int32_t>(width) - 1);
+			x1 = std::clamp(x1, x0 + 1, static_cast<std::int32_t>(width));
+			y0 = std::clamp(y0, 0, static_cast<std::int32_t>(height) - 1);
+			y1 = std::clamp(y1, y0 + 1, static_cast<std::int32_t>(height));
+
+			crop.rect = {{x0, y0}, {x1 - x0, y1 - y0}};
+
+			// the exact FOV of the whole pixels picked (NDC -1..1 spans the full width/height of the picture)
+			crop.fov.angleLeft = std::atan((2.0f * static_cast<float>(x0) / w - 1.0f) * tx);
+			crop.fov.angleRight = std::atan((2.0f * static_cast<float>(x1) / w - 1.0f) * tx);
+			crop.fov.angleUp = std::atan((1.0f - 2.0f * static_cast<float>(y0) / h) * ty);
+			crop.fov.angleDown = std::atan((1.0f - 2.0f * static_cast<float>(y1) / h) * ty);
+			return crop;
+		}
+
 		struct adapter_info
 		{
 			std::string name = "unknown";
@@ -663,17 +712,21 @@ namespace vr
 			const auto image_index = eye == 1 ? 1 : 0;
 			if (projection && this->copy_to_image(context, source, params.srgb, image_index))
 			{
-				const eye_view rendered{true, image_index, projection->pose, projection->fov};
+				const auto for_eye = [&](const int view)
+				{
+					return eye_view{true, image_index, projection->pose, projection->fov, projection->eye_fov[view]};
+				};
+
 				if (eye < 0)
 				{
-					this->eye_views_ = {rendered, rendered};
+					this->eye_views_ = {for_eye(0), for_eye(1)};
 				}
 				else
 				{
-					this->eye_views_[eye] = rendered;
+					this->eye_views_[eye] = for_eye(eye);
 					if (!this->eye_views_[1 - eye].valid)
 					{
-						this->eye_views_[1 - eye] = rendered; // until the other eye has its own picture
+						this->eye_views_[1 - eye] = for_eye(1 - eye); // until the other eye has its own picture
 					}
 				}
 			}
@@ -682,9 +735,32 @@ namespace vr
 			{
 				for (auto i = 0; i < 2; ++i)
 				{
-					projection_views[i].pose = this->eye_views_[i].pose;
-					projection_views[i].fov = this->eye_views_[i].fov;
-					projection_views[i].subImage = sub_image(this->eye_views_[i].image);
+					const auto& view = this->eye_views_[i];
+					const auto& target = this->images_[view.image];
+					const auto crop = crop_for_eye(view.rendered_fov, view.eye_fov, target.width, target.height);
+
+					projection_views[i].pose = view.pose;
+					projection_views[i].fov = crop.fov;
+					projection_views[i].subImage = sub_image(view.image);
+					projection_views[i].subImage.imageRect = crop.rect;
+
+					if (!this->crop_logged_ && i == 1)
+					{
+						this->crop_logged_ = true;
+						for (auto e = 0; e < 2; ++e)
+						{
+							const auto& v = this->eye_views_[e];
+							const auto c = crop_for_eye(v.rendered_fov, v.eye_fov, this->images_[v.image].width, this->images_[v.image].height);
+							log::info("{} eye shows pixels x {}-{} y {}-{} of the {}x{} picture: fov L{:.1f} R{:.1f} U{:.1f} D{:.1f} "
+								"(eye's own L{:.1f} R{:.1f} U{:.1f} D{:.1f})", e == 0 ? "Left" : "Right",
+								c.rect.offset.x, c.rect.offset.x + c.rect.extent.width, c.rect.offset.y, c.rect.offset.y + c.rect.extent.height,
+								this->images_[v.image].width, this->images_[v.image].height,
+								c.fov.angleLeft * math::to_degrees, c.fov.angleRight * math::to_degrees,
+								c.fov.angleUp * math::to_degrees, c.fov.angleDown * math::to_degrees,
+								v.eye_fov.angleLeft * math::to_degrees, v.eye_fov.angleRight * math::to_degrees,
+								v.eye_fov.angleUp * math::to_degrees, v.eye_fov.angleDown * math::to_degrees);
+						}
+					}
 				}
 
 				projection_layer.layerFlags = 0;
@@ -695,7 +771,7 @@ namespace vr
 
 				if (this->projected_frames_++ == 0)
 				{
-					const auto& fov = this->eye_views_[0].fov;
+					const auto& fov = this->eye_views_[0].rendered_fov;
 					log::info("First head-tracked frame shown ({}, fov L{:.1f} R{:.1f} U{:.1f} D{:.1f} degrees)",
 						eye < 0 ? "mono" : "stereo, alternating eyes",
 						fov.angleLeft * math::to_degrees, fov.angleRight * math::to_degrees,
