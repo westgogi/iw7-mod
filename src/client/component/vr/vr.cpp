@@ -6,6 +6,7 @@
 #include "xr_runtime.hpp"
 #include "head_tracking.hpp"
 #include "input.hpp"
+#include "game_view.hpp"
 
 #include "component/command.hpp"
 #include "component/directx.hpp"
@@ -17,6 +18,7 @@
 #include "version.hpp"
 
 #include <utils/flags.hpp>
+#include <utils/hook.hpp>
 
 // The frame loop. Every frame the image the game is about to present is copied into an OpenXR swapchain:
 // - in game, with head tracking on, it is shown as a projection layer from the exact pose it was rendered with
@@ -125,6 +127,17 @@ namespace vr
 					log::info("The game is presenting frames again");
 				}
 			}
+		}
+
+		// the game frame block the render thread is drawing and presenting right now (render thread only)
+		thread_local const void* presenting_frame_data = nullptr;
+		utils::hook::detour render_frame_hook;
+
+		void render_frame_stub(void* frame_data)
+		{
+			presenting_frame_data = frame_data;
+			render_frame_hook.invoke<void>(frame_data);
+			presenting_frame_data = nullptr;
 		}
 
 		std::atomic_bool vr_disabled = false;
@@ -355,10 +368,10 @@ namespace vr
 			if (submits_since_log > 0)
 			{
 				const auto counters = xr.performance_report();
-				log::info("Perf: game {:.1f} fps, headset frames {:.1f}/s ({:.0f}% head-tracked){}{}",
+				log::info("Perf: game {:.1f} fps, headset frames {:.1f}/s ({:.0f}% head-tracked) | {}{}{}",
 					static_cast<double>(presents_since_log) / elapsed, static_cast<double>(submits_since_log) / elapsed,
 					100.0 * static_cast<double>(tracked_since_log) / static_cast<double>(submits_since_log),
-					counters.empty() ? "" : " | runtime: ", counters);
+					head_tracking::pairing_report(), counters.empty() ? "" : " | runtime: ", counters);
 			}
 
 			last_performance_log = now;
@@ -448,7 +461,7 @@ namespace vr
 		last_present_ms = now_ms();
 
 		// always take this frame's record, so records stay matched to presents even when VR is idle
-		const auto record = head_tracking::pop_frame_record();
+		const auto record = head_tracking::pop_frame_record(presenting_frame_data);
 		controller_publisher controllers{};
 		++presents_since_log;
 
@@ -539,7 +552,7 @@ namespace vr
 			d3d_lock_guard lock(d3d_lock);
 			set_stage(loop_stage::submitting_frame);
 			runtime->submit_frame(dx::deviceContext, back_buffer, record.head_tracked ? &record.projection : nullptr,
-				read_screen_params());
+				read_screen_params(), record.repeat_previous);
 		}
 
 		if (back_buffer)
@@ -609,6 +622,7 @@ namespace vr
 			});
 
 			scheduler::loop(draw_version, scheduler::renderer);
+			render_frame_hook.create(game_view::render_frame, reinterpret_cast<void*>(render_frame_stub));
 		}
 
 		void pre_destroy() override

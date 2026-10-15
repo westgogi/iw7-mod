@@ -618,7 +618,7 @@ namespace vr
 	}
 
 	void xr_runtime::submit_frame(ID3D11DeviceContext* context, ID3D11Texture2D* source, const projection_info* projection,
-		const screen_params& params)
+		const screen_params& params, const bool repeat_projection)
 	{
 		if (!this->frame_waited_)
 		{
@@ -653,14 +653,15 @@ namespace vr
 			return image;
 		};
 
-		if (this->frame_state_.shouldRender && source && projection)
+		const auto repeat = !projection && repeat_projection && this->eye_views_[0].valid && this->eye_views_[1].valid;
+		if (this->frame_state_.shouldRender && (repeat || (source && projection)))
 		{
 			// Head tracking. With stereo the game draws one eye per frame (alternate-eye rendering): this frame's image
 			// replaces that eye's picture and the other eye keeps the one from the previous frame. Each picture is shown
 			// from exactly the pose it was rendered from; the runtime re-projects both to where the eyes are now.
-			const auto eye = projection->eye;
+			const auto eye = projection ? projection->eye : -1;
 			const auto image_index = eye == 1 ? 1 : 0;
-			if (this->copy_to_image(context, source, params.srgb, image_index))
+			if (projection && this->copy_to_image(context, source, params.srgb, image_index))
 			{
 				const eye_view rendered{true, image_index, projection->pose, projection->fov};
 				if (eye < 0)
@@ -694,10 +695,11 @@ namespace vr
 
 				if (this->projected_frames_++ == 0)
 				{
+					const auto& fov = this->eye_views_[0].fov;
 					log::info("First head-tracked frame shown ({}, fov L{:.1f} R{:.1f} U{:.1f} D{:.1f} degrees)",
 						eye < 0 ? "mono" : "stereo, alternating eyes",
-						projection->fov.angleLeft * math::to_degrees, projection->fov.angleRight * math::to_degrees,
-						projection->fov.angleUp * math::to_degrees, projection->fov.angleDown * math::to_degrees);
+						fov.angleLeft * math::to_degrees, fov.angleRight * math::to_degrees,
+						fov.angleUp * math::to_degrees, fov.angleDown * math::to_degrees);
 				}
 
 				if (eye >= 0 && !this->stereo_logged_ && this->eye_views_[0].image != this->eye_views_[1].image)

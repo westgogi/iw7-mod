@@ -96,8 +96,10 @@ namespace vr
 		// Begins the frame, copies `source` (may be null) and ends the frame. With `projection` the image is shown
 		// head-tracked from the pose it was rendered with; without it, on the virtual screen.
 		// Only valid after wait_frame() returned true. Call WITH the game's D3D11 lock held.
+		// With `repeat_projection` and no projection, the head-tracked pictures from earlier frames are shown again
+		// (for a present we can't match to a game frame).
 		void submit_frame(ID3D11DeviceContext* context, ID3D11Texture2D* source, const projection_info* projection,
-			const screen_params& params);
+			const screen_params& params, bool repeat_projection = false);
 
 		// Head and eye poses for `time` (thread-safe)
 		bool locate(XrTime time, view_state& out) const;

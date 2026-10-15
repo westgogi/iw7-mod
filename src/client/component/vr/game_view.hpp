@@ -23,6 +23,13 @@ namespace vr::game_view
 	// The game ignores the gamepad while it returns false.
 	constexpr std::uintptr_t gamepad_enabled = 0x140337800;
 
+	// Frame data handed from the game thread to the render thread. The game thread builds a frame in the block
+	// *frontend_frame_data points to (set by R_ToggleSmpFrame, cleared once the frame is handed over); the render thread
+	// runs render_frame(block) for it, which ends with the present. Matching the block tells us which game frame is
+	// being presented, whatever the queueing in between.
+	constexpr std::uintptr_t frontend_frame_data = 0x148F73088;
+	constexpr std::uintptr_t render_frame = 0x140E57390; // void (FrameData*), render thread
+
 	// Player profiles (one per controller): gamepad options. With gpadEnabled off the game runs "exec buttons_unbind"
 	// for the gamepad, so a pad does nothing even though it is read.
 	constexpr std::uintptr_t profiles = 0x1452456D0;

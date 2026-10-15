@@ -49,6 +49,7 @@ namespace vr::head_tracking
 		game::dvar_t* vr_aim_lag = nullptr;
 		game::dvar_t* vr_stereo = nullptr;
 		game::dvar_t* vr_postfx = nullptr;
+		game::dvar_t* vr_stereo_swap = nullptr;
 
 		constexpr float max_head_offset = 0.6f; // metres; keeps you from leaning far through walls
 
@@ -96,6 +97,12 @@ namespace vr::head_tracking
 
 		std::mutex records_mutex;
 		std::deque<frame_record> records;
+		std::uint64_t records_matched = 0;   // presents matched to their own frame
+		std::uint64_t records_stale = 0;     // records dropped because their frame was never presented
+		std::uint64_t records_missing = 0;   // presents with no record (kept the previous pictures)
+		std::uint64_t records_unpaired = 0;  // presents without a frame block to match (first-in-first-out)
+		std::uint64_t reported_stale = 0;
+		bool last_present_tracked = false;
 		std::atomic<std::uint64_t> view_calls = 0;
 		std::atomic<std::uint64_t> camera_frames = 0;
 		std::atomic<std::uint64_t> aim_calls = 0;
@@ -435,6 +442,7 @@ namespace vr::head_tracking
 			// Stereo (alternate-eye rendering): every other frame is drawn from the left eye, the rest from the right eye,
 			// each from that eye's own position, so near objects look right to each eye instead of from between them
 			const auto eye = vr_stereo->current.enabled ? static_cast<int>(stereo_frames++ % 2) : -1;
+			const auto shown_eye = eye >= 0 && vr_stereo_swap && vr_stereo_swap->current.enabled ? 1 - eye : eye;
 			const auto& rendered_pose = eye >= 0 ? pose.views.eye_pose[eye] : pose.views.head;
 			const auto unyaw = math::yaw_rotation(-reference_yaw);
 
@@ -496,7 +504,7 @@ namespace vr::head_tracking
 
 			projection_info projection{};
 			projection.pose = rendered_pose;
-			projection.eye = eye;
+			projection.eye = shown_eye;
 			projection.fov.angleLeft = -std::atan(tan_x);
 			projection.fov.angleRight = std::atan(tan_x);
 			projection.fov.angleUp = std::atan(tan_y);
@@ -506,6 +514,23 @@ namespace vr::head_tracking
 			if (!camera_logged)
 			{
 				camera_logged = true;
+				for (auto i = 0; i < 2; ++i)
+				{
+					const auto& fov = pose.views.eye_fov[i];
+					const auto eye_offset = math::rotate(math::multiply(XrQuaternionf{-pose.views.head.orientation.x,
+						-pose.views.head.orientation.y, -pose.views.head.orientation.z, pose.views.head.orientation.w},
+						XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f}), math::subtract(pose.views.eye_pose[i].position, pose.views.head.position));
+					log::info("{} eye: fov L{:.1f} R{:.1f} U{:.1f} D{:.1f}, offset from head x{:+.1f} y{:+.1f} z{:+.1f} mm, "
+						"orientation vs head {:.2f} degrees", i == 0 ? "Left" : "Right",
+						fov.angleLeft * math::to_degrees, fov.angleRight * math::to_degrees,
+						fov.angleUp * math::to_degrees, fov.angleDown * math::to_degrees,
+						eye_offset.x * 1000.0f, eye_offset.y * 1000.0f, eye_offset.z * 1000.0f,
+						2.0f * std::acos(std::clamp(std::abs(pose.views.head.orientation.x * pose.views.eye_pose[i].orientation.x
+							+ pose.views.head.orientation.y * pose.views.eye_pose[i].orientation.y
+							+ pose.views.head.orientation.z * pose.views.eye_pose[i].orientation.z
+							+ pose.views.head.orientation.w * pose.views.eye_pose[i].orientation.w), 0.0f, 1.0f)) * math::to_degrees);
+				}
+
 				log::info("Head-tracked camera active on thread {}: game yaw {:.1f} pitch {:.1f}, head yaw {:.1f} pitch {:.1f}, "
 					"fov tan {:.3f} x {:.3f} (the game had {:.3f} x {:.3f}, drawing with {:.3f} x {:.3f})",
 					GetCurrentThreadId(), game_yaw, last_game_pitch, pose.yaw, pose.pitch, tan_x, tan_y,
@@ -706,12 +731,26 @@ namespace vr::head_tracking
 				pending_projection.reset();
 			}
 
+			record.frame_data = *reinterpret_cast<void**>(game_view::frontend_frame_data);
+			record.frame_number = frame_number;
+
 			{
 				std::lock_guard _(records_mutex);
+
+				// a block being reused means its older frame can't be presented any more
+				if (record.frame_data)
+				{
+					std::erase_if(records, [&](const frame_record& queued)
+					{
+						return queued.frame_data == record.frame_data;
+					});
+				}
+
 				records.push_back(record);
-				while (records.size() > 3)
+				while (records.size() > 4)
 				{
 					records.pop_front(); // the render thread fell behind or skipped presents; drop the oldest
+					++records_stale;
 				}
 			}
 
@@ -729,23 +768,67 @@ namespace vr::head_tracking
 		}
 	}
 
-	frame_record pop_frame_record()
+	frame_record pop_frame_record(const void* frame_data)
 	{
 		std::lock_guard _(records_mutex);
-		if (records.empty())
-		{
-			return {};
-		}
 
-		const auto record = records.front();
-		records.pop_front();
+		frame_record record{};
+		if (!frame_data)
+		{
+			// don't know which frame is being presented: oldest first
+			++records_unpaired;
+			if (records.empty())
+			{
+				return {};
+			}
+
+			record = records.front();
+			records.pop_front();
+		}
+		else
+		{
+			const auto match = std::find_if(records.begin(), records.end(), [&](const frame_record& queued)
+			{
+				return queued.frame_data == frame_data;
+			});
+
+			if (match == records.end())
+			{
+				// a present for a frame we have no record of (e.g. a loading screen drawn by the render thread)
+				++records_missing;
+				record.repeat_previous = last_present_tracked;
+				return enabled() ? record : frame_record{};
+			}
+
+			// frames queued before this one were never presented
+			const auto stale = static_cast<std::uint64_t>(std::distance(records.begin(), match));
+			records_stale += stale;
+			record = *match;
+			records.erase(records.begin(), match + 1);
+			++records_matched;
+		}
 
 		if (!enabled())
 		{
+			last_present_tracked = false;
 			return {};
 		}
 
+		last_present_tracked = record.head_tracked;
 		return record;
+	}
+
+	std::string pairing_report()
+	{
+		std::lock_guard _(records_mutex);
+		const auto report = std::format("frames matched {}, never presented {}, presents without a frame {}, unpaired {}",
+			records_matched, records_stale, records_missing, records_unpaired);
+		if (records_stale != reported_stale)
+		{
+			reported_stale = records_stale;
+		}
+
+		return report;
 	}
 
 	void recenter()
@@ -797,6 +880,8 @@ namespace vr::head_tracking
 				"VR: frames between feeding the game a head turn and its view showing it. -1 = measure automatically");
 			vr_stereo = game::Dvar_RegisterBool("vr_stereo", true, game::DVAR_FLAG_SAVED,
 				"VR: 3D. Each frame is drawn from one eye, alternating left and right. 0 = both eyes see the same picture");
+			vr_stereo_swap = game::Dvar_RegisterBool("vr_stereo_swap", false, game::DVAR_FLAG_NONE,
+				"VR: developer test, show each eye's picture to the other eye");
 			vr_postfx = game::Dvar_RegisterBool("vr_postfx", true, game::DVAR_FLAG_SAVED,
 				"VR: switch off motion blur, depth of field and temporal anti-aliasing while head tracking is on");
 

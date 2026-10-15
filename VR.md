@@ -42,6 +42,7 @@ Logs are written to `iw7-vr.log` next to the exe; the previous run is kept as `i
 | `vr_refresh_rate` | ask the headset for a refresh rate (Hz), 0 = unchanged |
 | `vr_stereo` | 3D by alternate-eye rendering (each frame draws one eye); 0 = both eyes see the same picture |
 | `vr_postfx` | switch off motion blur, depth of field and temporal AA while head tracking is on |
+| `vr_stereo_swap` | developer test: show each eye's picture to the other eye |
 | `vr_aim_lag` | developer: frames before the game shows an aim change, -1 = measure |
 | `vr_dump_game` | developer: writes the decrypted game image to `iw7_ship.dump.exe` for analysis |
 | `-novr` | launch flag that starts with VR off |
