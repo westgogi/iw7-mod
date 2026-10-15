@@ -415,6 +415,8 @@ namespace vr
 		if (XR_SUCCEEDED(xrGetSystemProperties(this->instance_, this->system_id_, &properties)))
 		{
 			this->system_name_ = properties.systemName;
+			this->max_image_size_ = std::min(properties.graphicsProperties.maxSwapchainImageWidth,
+				properties.graphicsProperties.maxSwapchainImageHeight);
 			log::info("Headset: {} (vendor {:#x}), max swapchain {}x{}, max layers {}, rotation tracking: {}, position tracking: {}",
 				properties.systemName, properties.vendorId,
 				properties.graphicsProperties.maxSwapchainImageWidth, properties.graphicsProperties.maxSwapchainImageHeight,
@@ -714,12 +716,13 @@ namespace vr
 			{
 				const auto for_eye = [&](const int view)
 				{
-					return eye_view{true, image_index, projection->pose, projection->fov, projection->eye_fov[view]};
+					return eye_view{true, image_index, projection->pose, projection->fov, projection->eye_fov[view], projection->world_yaw};
 				};
 
 				if (eye < 0)
 				{
 					this->eye_views_ = {for_eye(0), for_eye(1)};
+					this->newest_eye_ = -1;
 				}
 				else
 				{
@@ -728,6 +731,8 @@ namespace vr
 					{
 						this->eye_views_[1 - eye] = for_eye(1 - eye); // until the other eye has its own picture
 					}
+
+					this->newest_eye_ = eye;
 				}
 			}
 
@@ -740,6 +745,26 @@ namespace vr
 					const auto crop = crop_for_eye(view.rendered_fov, view.eye_fov, target.width, target.height);
 
 					projection_views[i].pose = view.pose;
+
+					// Alternate-eye stereo: this eye's picture is a frame older than the other eye's. If the game turned
+					// the player since (stick turn), turn the older picture by the same amount, otherwise the two eyes
+					// disagree about where everything is for that frame (the world shimmers in depth while turning).
+					if (this->newest_eye_ >= 0 && i != this->newest_eye_)
+					{
+						const auto turned = math::wrap_degrees(this->eye_views_[this->newest_eye_].world_yaw - view.world_yaw);
+						if (std::abs(turned) > 0.001f && std::abs(turned) < 30.0f)
+						{
+							projection_views[i].pose.orientation = math::multiply(math::yaw_rotation(-turned * math::to_radians),
+								view.pose.orientation);
+
+							if (!this->turn_logged_ && std::abs(turned) > 0.5f)
+							{
+								this->turn_logged_ = true;
+								log::info("Turning: the older eye's picture is turned {:.2f} degrees to match the newer one", -turned);
+							}
+						}
+					}
+
 					projection_views[i].fov = crop.fov;
 					projection_views[i].subImage = sub_image(view.image);
 					projection_views[i].subImage.imageRect = crop.rect;
@@ -789,9 +814,13 @@ namespace vr
 		{
 			// virtual screen; head-tracked pictures from before are stale now
 			this->eye_views_ = {};
+			this->newest_eye_ = -1;
 			this->update_anchor(this->frame_state_.predictedDisplayTime);
 
-			const auto aspect = static_cast<float>(this->images_[0].height) / static_cast<float>(this->images_[0].width);
+			// height / width. The game can lay its picture out for another shape than its pixels (rendering at the
+			// headset's resolution keeps the menus at the window's shape), so prefer the shape it says it drew for.
+			const auto aspect = params.aspect > 0.1f ? 1.0f / params.aspect
+				: static_cast<float>(this->images_[0].height) / static_cast<float>(this->images_[0].width);
 
 			quad.layerFlags = 0; // ignore the game's alpha channel, the screen is opaque
 			quad.space = params.follow_head ? this->view_space_ : this->local_space_;

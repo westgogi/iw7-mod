@@ -10,7 +10,7 @@ The build output is `iw7-vr.exe`, so it can live next to the official `iw7-mod.e
 |---|---|
 | 1. Virtual screen: the game on a big screen in the headset | working |
 | 2. Head-tracked camera | working (FOV verified by the projection probe; aim timing 0 frames) |
-| 3. Stereo 3D | alternate-eye rendering in testing (`vr_stereo`) |
+| 3. Stereo 3D | working: alternate-eye rendering, each eye shown its exact FOV; renders at the headset's resolution (`vr_resolution`) |
 | 4. Motion controls and controller-aimed weapons | controllers as a gamepad + smooth/snap turn in testing; aiming planned |
 | 5. Menus, HUD and cutscenes in VR | planned |
 | 6. Comfort options, Jackal cockpit, polish | planned |
@@ -41,9 +41,11 @@ Logs are written to `iw7-vr.log` next to the exe; the previous run is kept as `i
 | `vr_rumble` | controller vibration strength |
 | `vr_refresh_rate` | ask the headset for a refresh rate (Hz), 0 = unchanged |
 | `vr_stereo` | 3D by alternate-eye rendering (each frame draws one eye); 0 = both eyes see the same picture |
+| `vr_resolution` | render resolution as a multiple of what the headset asks for (1 = default); lower it if the frame rate drops, 0 = the window's size. Needs windowed or borderless display mode |
 | `vr_postfx` | switch off motion blur, depth of field and temporal AA while head tracking is on |
 | `vr_stereo_swap` | developer test: show each eye's picture to the other eye |
 | `vr_aim_lag` | developer: frames before the game shows an aim change, -1 = measure |
+| `vr_render_width` / `vr_render_height` | set automatically: the size the game renders at in VR, saved so it starts at it next time |
 | `vr_dump_game` | developer: writes the decrypted game image to `iw7_ship.dump.exe` for analysis |
 | `-novr` | launch flag that starts with VR off |
 
@@ -53,6 +55,7 @@ Logs are written to `iw7-vr.log` next to the exe; the previous run is kept as `i
   - `xr_runtime.*`: OpenXR instance, session, swapchains, controller actions, haptics, perf counters
   - `head_tracking.cpp`: head-tracked camera (submit_view hook), head aim, aim timing, projection probe
   - `input.*`: Touch controllers -> virtual XInput pad, smooth/snap turn
+  - `render_size.*`: renders the game at the headset's resolution while the window keeps its size
   - `game_view.hpp`: game addresses and the RefdefView layout
   - `vr.cpp`: dvars, commands, start/retry, D3D locking
   - `vr_log.*`: logging
@@ -61,6 +64,10 @@ Logs are written to `iw7-vr.log` next to the exe; the previous run is kept as `i
 - Hooks into upstream code: `component/gui/gui.cpp` (present hook calls `vr::on_present`), `component/updater.cpp` (no exe updates)
 
 Each frame, the present hook on the render thread calls `xrWaitFrame` without holding the game's D3D11 lock. It then takes the lock for `xrBeginFrame`, the back-buffer copy and `xrEndFrame`.
+
+Stereo is alternate-eye rendering: each game frame is drawn from one eye with a symmetric frustum covering both eyes' fields of view, and each eye is shown only its own part of the picture (with that part's exact FOV). The other eye keeps its previous picture; if the game turned the player in between, that older picture is turned by the same amount so both eyes agree.
+
+The game renders at a size worked out from the runtime's recommended per-eye resolution and the eyes' FOVs (`render_size.cpp`). It hooks the game's window-size setup so the swap chain and render targets get that size while the window, its placement and the menus' aspect ratio stay as they were; the window shows the bigger picture scaled down.
 
 ## Building
 

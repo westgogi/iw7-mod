@@ -46,6 +46,7 @@ namespace vr
 		float height_offset = 0.0f; // metres, positive moves the screen up
 		bool follow_head = false;   // lock the screen to the headset instead of the room
 		bool srgb = true;           // treat the game's image as gamma (sRGB) encoded
+		float aspect = 0.0f;        // width / height the game laid its picture out for; 0 = the image's own shape
 	};
 
 	// Where the headset and both eyes are at a given time, in the LOCAL reference space
@@ -64,6 +65,10 @@ namespace vr
 		XrFovf fov{};        // what the picture was rendered with: symmetric, covering both eyes
 		XrFovf eye_fov[2]{}; // each eye's own (asymmetric) field of view at the time
 		int eye = -1;        // 0 = left, 1 = right (alternate-eye stereo), -1 = the same picture for both eyes
+		// How far the game world was turned against the tracking space when this was drawn (degrees, positive = left):
+		// game yaw = tracking yaw + world_yaw. Stick turns change it; with alternating eyes the other eye's older
+		// picture is turned by the difference so both eyes agree on where things are.
+		float world_yaw = 0.0f;
 	};
 
 	const char* to_string(XrResult result);
@@ -129,6 +134,22 @@ namespace vr
 		// Ask the headset for another refresh rate (Meta runtimes); 0 or an unavailable rate does nothing
 		void request_refresh_rate(float hz);
 
+		// The runtime's recommended resolution per eye and the largest image it accepts (0 when unknown)
+		std::uint32_t recommended_eye_width() const
+		{
+			return this->eye_width_;
+		}
+
+		std::uint32_t recommended_eye_height() const
+		{
+			return this->eye_height_;
+		}
+
+		std::uint32_t max_image_size() const
+		{
+			return this->max_image_size_;
+		}
+
 	private:
 		// The game's picture goes into images_[0] (virtual screen, left eye or both eyes) or images_[1] (right eye)
 		struct image_swapchain
@@ -169,12 +190,15 @@ namespace vr
 			XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 			XrFovf rendered_fov{}; // the picture's symmetric FOV
 			XrFovf eye_fov{};      // the part of it this eye shows
+			float world_yaw = 0.0f;
 		};
 
 		bool crop_logged_ = false;
 
 		std::array<eye_view, 2> eye_views_{};
+		int newest_eye_ = -1; // the eye whose picture is the most recent (alternate-eye stereo)
 		bool stereo_logged_ = false;
+		bool turn_logged_ = false;
 
 		XrPosef anchor_{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 		bool recenter_requested_ = true;
@@ -212,6 +236,7 @@ namespace vr
 		std::string system_name_;
 		std::uint32_t eye_width_ = 0;
 		std::uint32_t eye_height_ = 0;
+		std::uint32_t max_image_size_ = 0;
 		std::uint64_t frames_submitted_ = 0;
 		bool waiting_for_headset_logged_ = false;
 		std::unordered_set<std::string> reported_problems_;

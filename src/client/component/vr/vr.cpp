@@ -7,6 +7,7 @@
 #include "head_tracking.hpp"
 #include "input.hpp"
 #include "game_view.hpp"
+#include "render_size.hpp"
 
 #include "component/command.hpp"
 #include "component/directx.hpp"
@@ -129,6 +130,180 @@ namespace vr
 			}
 		}
 
+		std::atomic_bool vr_disabled = false;
+
+		// ---- GPU time per game frame --------------------------------------------------------------------------------
+		// Timestamps when the render thread starts drawing a frame and right before it presents it, read back a few
+		// frames later without waiting. Render thread only, with the game's D3D lock held.
+
+		class gpu_timer
+		{
+		public:
+			~gpu_timer()
+			{
+				this->release();
+			}
+
+			void begin(ID3D11Device* device, ID3D11DeviceContext* context)
+			{
+				if (device != this->device_)
+				{
+					this->release();
+					this->device_ = device;
+					this->ready_ = this->create();
+				}
+
+				if (!this->ready_)
+				{
+					return;
+				}
+
+				if (this->open_ >= 0)
+				{
+					// the previous frame was never presented; close its measurement and drop it
+					context->End(this->slots_[this->open_].disjoint);
+					this->open_ = -1;
+				}
+
+				this->next_ = (this->next_ + 1) % slot_count;
+				auto& slot = this->slots_[this->next_];
+				slot.pending = false;
+				context->Begin(slot.disjoint);
+				context->End(slot.start);
+				this->open_ = this->next_;
+			}
+
+			void end(ID3D11DeviceContext* context)
+			{
+				if (!this->ready_ || this->open_ < 0)
+				{
+					return;
+				}
+
+				auto& slot = this->slots_[this->open_];
+				context->End(slot.finish);
+				context->End(slot.disjoint);
+				slot.pending = true;
+				this->open_ = -1;
+
+				this->collect(context);
+			}
+
+			// average and worst GPU milliseconds of the frames measured since the last call
+			bool take(double& average, double& worst)
+			{
+				if (this->frames_ == 0)
+				{
+					return false;
+				}
+
+				average = this->total_ms_ / static_cast<double>(this->frames_);
+				worst = this->worst_ms_;
+				this->total_ms_ = 0.0;
+				this->worst_ms_ = 0.0;
+				this->frames_ = 0;
+				return true;
+			}
+
+		private:
+			static constexpr int slot_count = 6;
+
+			struct slot
+			{
+				ID3D11Query* disjoint = nullptr;
+				ID3D11Query* start = nullptr;
+				ID3D11Query* finish = nullptr;
+				bool pending = false;
+			};
+
+			ID3D11Device* device_ = nullptr;
+			bool ready_ = false;
+			std::array<slot, slot_count> slots_{};
+			int next_ = 0;
+			int open_ = -1;
+			double total_ms_ = 0.0;
+			double worst_ms_ = 0.0;
+			std::uint64_t frames_ = 0;
+
+			bool create()
+			{
+				if (!this->device_)
+				{
+					return false;
+				}
+
+				D3D11_QUERY_DESC disjoint_desc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+				D3D11_QUERY_DESC timestamp_desc{D3D11_QUERY_TIMESTAMP, 0};
+				for (auto& slot : this->slots_)
+				{
+					if (FAILED(this->device_->CreateQuery(&disjoint_desc, &slot.disjoint))
+						|| FAILED(this->device_->CreateQuery(&timestamp_desc, &slot.start))
+						|| FAILED(this->device_->CreateQuery(&timestamp_desc, &slot.finish)))
+					{
+						log::warn("Couldn't create GPU timing queries; the log won't show GPU frame times");
+						this->release();
+						return false;
+					}
+				}
+
+				return true;
+			}
+
+			void release()
+			{
+				for (auto& slot : this->slots_)
+				{
+					for (auto** query : {&slot.disjoint, &slot.start, &slot.finish})
+					{
+						if (*query)
+						{
+							(*query)->Release();
+							*query = nullptr;
+						}
+					}
+
+					slot.pending = false;
+				}
+
+				this->ready_ = false;
+				this->open_ = -1;
+			}
+
+			void collect(ID3D11DeviceContext* context)
+			{
+				for (auto& slot : this->slots_)
+				{
+					if (!slot.pending)
+					{
+						continue;
+					}
+
+					D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+					UINT64 start = 0;
+					UINT64 finish = 0;
+					if (context->GetData(slot.disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK
+						|| context->GetData(slot.start, &start, sizeof(start), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK
+						|| context->GetData(slot.finish, &finish, sizeof(finish), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+					{
+						continue; // not finished on the GPU yet
+					}
+
+					slot.pending = false;
+					if (disjoint.Disjoint || disjoint.Frequency == 0 || finish < start)
+					{
+						continue;
+					}
+
+					const auto ms = static_cast<double>(finish - start) * 1000.0 / static_cast<double>(disjoint.Frequency);
+					this->total_ms_ += ms;
+					this->worst_ms_ = std::max(this->worst_ms_, ms);
+					++this->frames_;
+				}
+			}
+		};
+
+		gpu_timer frame_timer;
+
 		// the game frame block the render thread is drawing and presenting right now (render thread only)
 		thread_local const void* presenting_frame_data = nullptr;
 		utils::hook::detour render_frame_hook;
@@ -136,11 +311,22 @@ namespace vr
 		void render_frame_stub(void* frame_data)
 		{
 			presenting_frame_data = frame_data;
+
+			// start this frame's GPU timing; never wait for the D3D lock here (whoever holds it may be waiting for us)
+			if (!vr_disabled && dx::device && dx::deviceContext && !dx::d3d12Device)
+			{
+				const auto lock = *reinterpret_cast<HANDLE*>(0x148B1BC98);
+				const auto taken = lock ? WaitForSingleObject(lock, 0) : WAIT_TIMEOUT;
+				if (taken == WAIT_OBJECT_0 || taken == WAIT_ABANDONED)
+				{
+					frame_timer.begin(dx::device, dx::deviceContext);
+					ReleaseMutex(lock);
+				}
+			}
+
 			render_frame_hook.invoke<void>(frame_data);
 			presenting_frame_data = nullptr;
 		}
-
-		std::atomic_bool vr_disabled = false;
 		std::atomic_bool session_has_run = false;
 		std::atomic_bool restart_requested = false;
 		std::atomic_bool recenter_requested = false;
@@ -216,6 +402,7 @@ namespace vr
 				params.srgb = vr_screen_srgb->current.enabled;
 			}
 
+			params.aspect = render_size::ui_aspect();
 			return params;
 		}
 
@@ -309,6 +496,28 @@ namespace vr
 
 			console::info("[VR] %s\n", head_tracking::status().data());
 			console::info("[VR] %s\n", input::status().data());
+			console::info("[VR] %s\n", render_size::status().data());
+		}
+
+		// main thread, once a second: tell render_size what the headset wants
+		void update_render_size()
+		{
+			render_size::headset_view view{};
+			{
+				std::lock_guard _(pose_mutex);
+				view_state state{};
+				if (runtime && !vr_disabled && runtime->is_session_running()
+					&& runtime->locate(runtime->predicted_time(1.0f), state))
+				{
+					view.eye_fov[0] = state.eye_fov[0];
+					view.eye_fov[1] = state.eye_fov[1];
+					view.eye_width = runtime->recommended_eye_width();
+					view.eye_height = runtime->recommended_eye_height();
+					view.max_size = runtime->max_image_size();
+				}
+			}
+
+			render_size::update(view);
 		}
 
 		void destroy_runtime()
@@ -368,10 +577,14 @@ namespace vr
 			if (submits_since_log > 0)
 			{
 				const auto counters = xr.performance_report();
-				log::info("Perf: game {:.1f} fps, headset frames {:.1f}/s ({:.0f}% head-tracked) | {}{}{}",
+				auto gpu_average = 0.0;
+				auto gpu_worst = 0.0;
+				const auto gpu = frame_timer.take(gpu_average, gpu_worst)
+					? std::format("GPU {:.2f} ms per frame (worst {:.2f}) | ", gpu_average, gpu_worst) : std::string();
+				log::info("Perf: game {:.1f} fps, headset frames {:.1f}/s ({:.0f}% head-tracked) | {}{}{}{}",
 					static_cast<double>(presents_since_log) / elapsed, static_cast<double>(submits_since_log) / elapsed,
 					100.0 * static_cast<double>(tracked_since_log) / static_cast<double>(submits_since_log),
-					head_tracking::pairing_report(), counters.empty() ? "" : " | runtime: ", counters);
+					gpu, head_tracking::pairing_report(), counters.empty() ? "" : " | runtime: ", counters);
 			}
 
 			last_performance_log = now;
@@ -408,11 +621,19 @@ namespace vr
 			}
 
 			static constexpr auto text = "IW7-VR " GIT_DESCRIBE;
-			const auto text_width = static_cast<float>(game::R_TextWidth(text, std::numeric_limits<int>::max(), font));
+			const auto gameplay = head_tracking::gameplay_active();
+
+			// The same size relative to the picture whatever its resolution. On the virtual screen the picture is shown
+			// at the shape the game laid it out for, which makes its pixels wider than tall when rendering at the
+			// headset's resolution; in the headset view they're square.
+			const auto pixel_aspect = game_view::current_vid_config().display_pixel_aspect;
+			const auto y_scale = std::max(1.0f, height / 1200.0f);
+			const auto x_scale = y_scale * (!gameplay && pixel_aspect > 0.2f && pixel_aspect < 5.0f ? 1.0f / pixel_aspect : 1.0f);
+			const auto text_width = static_cast<float>(game::R_TextWidth(text, std::numeric_limits<int>::max(), font)) * x_scale;
 
 			float x;
 			float y;
-			if (head_tracking::gameplay_active())
+			if (gameplay)
 			{
 				const auto since = head_tracking::gameplay_since_ms();
 				if (since == 0 || now_ms() - since > 10'000)
@@ -425,12 +646,12 @@ namespace vr
 			}
 			else
 			{
-				x = width - text_width - 24.0f;
-				y = 24.0f + static_cast<float>(font->pixelHeight);
+				x = width - text_width - 24.0f * x_scale;
+				y = (24.0f + static_cast<float>(font->pixelHeight)) * y_scale;
 			}
 
 			float color[4]{1.0f, 1.0f, 1.0f, 0.6f};
-			game::R_AddCmdDrawText(text, std::numeric_limits<int>::max(), font, x, y, 1.0f, 1.0f, 0.0f, color, 0);
+			game::R_AddCmdDrawText(text, std::numeric_limits<int>::max(), font, x, y, x_scale, y_scale, 0.0f, color, 0);
 		}
 	}
 
@@ -487,6 +708,9 @@ namespace vr
 			set_stage(loop_stage::waiting_d3d_lock);
 			d3d_lock_guard lock(d3d_lock);
 			set_stage(loop_stage::starting_runtime);
+
+			// the game has issued all of this frame's drawing
+			frame_timer.end(dx::deviceContext);
 
 			if (restart_requested.exchange(false))
 			{
@@ -622,6 +846,7 @@ namespace vr
 			});
 
 			scheduler::loop(draw_version, scheduler::renderer);
+			scheduler::loop(update_render_size, scheduler::main, 1s);
 			render_frame_hook.create(game_view::render_frame, reinterpret_cast<void*>(render_frame_stub));
 		}
 

@@ -30,7 +30,7 @@
 //     rendered with.
 //  3. Before R_EndFrame the record is queued; the render thread pops it when it presents that frame and hands the
 //     image to the headset as a projection layer, so the runtime knows exactly where it was rendered from.
-// Both eyes still get the same image (no stereo yet).
+// Stereo is alternate-eye rendering: each frame is drawn from one eye, and each eye keeps showing its latest picture.
 //
 // Yaw: the game's view yaw already contains the head turns we fed into the aim, so the camera simply uses it. If the
 // game only shows an aim change a frame (or two) after we feed it, the camera would lag the head by that much and the
@@ -510,6 +510,8 @@ namespace vr::head_tracking
 			projection_info projection{};
 			projection.pose = rendered_pose;
 			projection.eye = shown_eye;
+			// camera yaw = body_yaw + (tracking yaw - reference yaw), so the tracking space is turned by this in the game
+			projection.world_yaw = math::wrap_degrees(body_yaw - reference_yaw * math::to_degrees);
 			projection.eye_fov[0] = pose.views.eye_fov[0];
 			projection.eye_fov[1] = pose.views.eye_fov[1];
 			projection.fov.angleLeft = -std::atan(tan_x);
