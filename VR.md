@@ -8,10 +8,10 @@ The build output is `iw7-vr.exe`, so it can live next to the official `iw7-mod.e
 
 | Milestone | State |
 |---|---|
-| 1. Virtual screen: the game on a big screen in the headset | in testing |
-| 2. Head-tracked camera | next (needs reverse engineering) |
+| 1. Virtual screen: the game on a big screen in the headset | working |
+| 2. Head-tracked camera | in testing (FOV fix + aim timing in the latest build) |
 | 3. Stereo 3D | planned |
-| 4. Motion controls and controller-aimed weapons | planned |
+| 4. Motion controls and controller-aimed weapons | controllers as a gamepad + smooth/snap turn in testing; aiming planned |
 | 5. Menus, HUD and cutscenes in VR | planned |
 | 6. Comfort options, Jackal cockpit, polish | planned |
 
@@ -33,13 +33,24 @@ Logs are written to `iw7-vr.log` next to the exe; the previous run is kept as `i
 | `vr_screen_distance` / `vr_screen_width` / `vr_screen_height` | screen placement in metres |
 | `vr_screen_follow_head` | lock the screen to your head |
 | `vr_screen_srgb` | colour fix: off if the image looks too dark, on if washed out |
+| `vr_mode` | 1 = head tracking in game, 0 = always the virtual screen |
+| `vr_head_aim` / `vr_head_position` | aim where you look / move the camera with your head |
+| `vr_controllers` | use the VR controllers as a gamepad |
+| `vr_turn_mode` / `vr_turn_speed` / `vr_snap_angle` | right stick: 0 game stick look, 1 smooth, 2 snap |
+| `vr_stick_pitch` | let the right stick look up/down too |
+| `vr_rumble` | controller vibration strength |
+| `vr_refresh_rate` | ask the headset for a refresh rate (Hz), 0 = unchanged |
+| `vr_aim_lag` | developer: frames before the game shows an aim change, -1 = measure |
 | `vr_dump_game` | developer: writes the decrypted game image to `iw7_ship.dump.exe` for analysis |
 | `-novr` | launch flag that starts with VR off |
 
 ## Code
 
 - `src/client/component/vr/`: the VR component
-  - `xr_runtime.*`: OpenXR instance, session, swapchains, frame loop
+  - `xr_runtime.*`: OpenXR instance, session, swapchains, controller actions, haptics, perf counters
+  - `head_tracking.cpp`: head-tracked camera (submit_view hook), head aim, aim timing, projection probe
+  - `input.*`: Touch controllers -> virtual XInput pad, smooth/snap turn
+  - `game_view.hpp`: game addresses and the RefdefView layout
   - `vr.cpp`: dvars, commands, start/retry, D3D locking
   - `vr_log.*`: logging
   - `re_tools.cpp`: reverse-engineering helpers

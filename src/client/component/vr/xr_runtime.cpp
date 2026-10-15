@@ -3,6 +3,7 @@
 #include "xr_runtime.hpp"
 #include "xr_math.hpp"
 #include "vr_log.hpp"
+#include "input.hpp"
 
 #include <openxr/openxr_reflection.h>
 
@@ -169,6 +170,14 @@ namespace vr
 			{
 				has_d3d11 = true;
 			}
+			else if (std::strcmp(extension.extensionName, XR_META_PERFORMANCE_METRICS_EXTENSION_NAME) == 0)
+			{
+				this->has_performance_metrics_ = true;
+			}
+			else if (std::strcmp(extension.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0)
+			{
+				this->has_refresh_rate_ = true;
+			}
 
 			names += extension.extensionName;
 			names += ' ';
@@ -181,7 +190,16 @@ namespace vr
 			throw xr_error("The active OpenXR runtime doesn't support Direct3D 11 (XR_KHR_D3D11_enable), which this game needs.", false);
 		}
 
-		const char* enabled_extensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+		std::vector<const char*> enabled_extensions{XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+		if (this->has_performance_metrics_)
+		{
+			enabled_extensions.push_back(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
+		}
+
+		if (this->has_refresh_rate_)
+		{
+			enabled_extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+		}
 
 		XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
 		copy_string(create_info.applicationInfo.applicationName, "IW7-VR");
@@ -189,8 +207,8 @@ namespace vr
 		copy_string(create_info.applicationInfo.engineName, "IW7");
 		create_info.applicationInfo.engineVersion = 7;
 		create_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-		create_info.enabledExtensionCount = static_cast<std::uint32_t>(std::size(enabled_extensions));
-		create_info.enabledExtensionNames = enabled_extensions;
+		create_info.enabledExtensionCount = static_cast<std::uint32_t>(enabled_extensions.size());
+		create_info.enabledExtensionNames = enabled_extensions.data();
 
 		result = xrCreateInstance(&create_info, &this->instance_);
 		if (result == XR_ERROR_API_VERSION_UNSUPPORTED)
@@ -209,6 +227,21 @@ namespace vr
 		}
 
 		log::info("OpenXR runtime: {}", this->runtime_name_);
+
+		try
+		{
+			this->create_actions();
+		}
+		catch (const xr_error& e)
+		{
+			// not fatal: the game still works with mouse, keyboard or a real gamepad
+			log::error("VR controllers unavailable: {}", e.what());
+			if (this->action_set_ != XR_NULL_HANDLE)
+			{
+				xrDestroyActionSet(this->action_set_);
+				this->action_set_ = XR_NULL_HANDLE;
+			}
+		}
 	}
 
 	xr_runtime::~xr_runtime()
@@ -228,6 +261,11 @@ namespace vr
 		if (this->session_ != XR_NULL_HANDLE)
 		{
 			xrDestroySession(this->session_);
+		}
+
+		if (this->action_set_ != XR_NULL_HANDLE)
+		{
+			xrDestroyActionSet(this->action_set_);
 		}
 
 		if (this->instance_ != XR_NULL_HANDLE)
@@ -303,6 +341,9 @@ namespace vr
 
 		this->query_swapchain_formats();
 		this->pick_blend_mode();
+		this->attach_actions();
+		this->setup_performance_metrics();
+		this->setup_refresh_rate();
 
 		log::info("Session created, waiting for the runtime to start it");
 		return true;
@@ -431,6 +472,17 @@ namespace vr
 				this->recenter_requested_ = true;
 				++this->space_changes_;
 				break;
+
+			case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
+				this->log_interaction_profiles();
+				break;
+
+			case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
+			{
+				const auto& changed = *reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(&event);
+				log::info("Headset refresh rate changed: {:.0f} Hz -> {:.0f} Hz", changed.fromDisplayRefreshRate, changed.toDisplayRefreshRate);
+				break;
+			}
 
 			default:
 				break;
@@ -844,6 +896,512 @@ namespace vr
 		return pose;
 	}
 
+	std::string xr_runtime::path_string(const XrPath path) const
+	{
+		char buffer[XR_MAX_PATH_LENGTH]{};
+		std::uint32_t length = 0;
+		if (XR_FAILED(xrPathToString(this->instance_, path, static_cast<std::uint32_t>(sizeof(buffer)), &length, buffer)))
+		{
+			return "?";
+		}
+
+		return buffer;
+	}
+
+	// ---- controllers --------------------------------------------------------------------------------------------------
+
+	void xr_runtime::create_actions()
+	{
+		check(xrStringToPath(this->instance_, "/user/hand/left", &this->hand_paths_[0]), "xrStringToPath");
+		check(xrStringToPath(this->instance_, "/user/hand/right", &this->hand_paths_[1]), "xrStringToPath");
+
+		XrActionSetCreateInfo set_info{XR_TYPE_ACTION_SET_CREATE_INFO};
+		copy_string(set_info.actionSetName, "gameplay");
+		copy_string(set_info.localizedActionSetName, "Gameplay");
+		set_info.priority = 0;
+		check(xrCreateActionSet(this->instance_, &set_info, &this->action_set_), "xrCreateActionSet");
+
+		const auto create = [this](XrAction& action, const char* name, const char* localized, const XrActionType type,
+			const bool per_hand)
+		{
+			XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+			copy_string(info.actionName, name);
+			copy_string(info.localizedActionName, localized);
+			info.actionType = type;
+			if (per_hand)
+			{
+				info.countSubactionPaths = 2;
+				info.subactionPaths = this->hand_paths_;
+			}
+
+			check(xrCreateAction(this->action_set_, &info, &action), "xrCreateAction");
+		};
+
+		create(this->thumbstick_action_, "thumbstick", "Thumbsticks", XR_ACTION_TYPE_VECTOR2F_INPUT, true);
+		create(this->trigger_action_, "trigger", "Triggers", XR_ACTION_TYPE_FLOAT_INPUT, true);
+		create(this->grip_action_, "grip", "Grips", XR_ACTION_TYPE_FLOAT_INPUT, true);
+		create(this->thumbstick_click_action_, "thumbstick_click", "Thumbstick clicks", XR_ACTION_TYPE_BOOLEAN_INPUT, true);
+		create(this->button_a_action_, "button_a", "A button", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+		create(this->button_b_action_, "button_b", "B button", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+		create(this->button_x_action_, "button_x", "X button", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+		create(this->button_y_action_, "button_y", "Y button", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+		create(this->menu_action_, "menu", "Menu button", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+		create(this->haptic_action_, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, true);
+
+		struct binding
+		{
+			XrAction action;
+			const char* path;
+		};
+
+		const auto suggest = [this](const char* profile, const std::vector<binding>& bindings)
+		{
+			std::vector<XrActionSuggestedBinding> suggested;
+			for (const auto& entry : bindings)
+			{
+				XrPath path = XR_NULL_PATH;
+				check(xrStringToPath(this->instance_, entry.path, &path), "xrStringToPath");
+				suggested.push_back({entry.action, path});
+			}
+
+			XrPath profile_path = XR_NULL_PATH;
+			check(xrStringToPath(this->instance_, profile, &profile_path), "xrStringToPath");
+
+			XrInteractionProfileSuggestedBinding info{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+			info.interactionProfile = profile_path;
+			info.countSuggestedBindings = static_cast<std::uint32_t>(suggested.size());
+			info.suggestedBindings = suggested.data();
+
+			const auto result = xrSuggestInteractionProfileBindings(this->instance_, &info);
+			if (XR_FAILED(result))
+			{
+				log::warn("The runtime rejected the controller bindings for {}: {}", profile, to_string(result));
+				return false;
+			}
+
+			return true;
+		};
+
+		// Quest / Rift Touch controllers (Quest 3's Touch Plus controllers use this profile too)
+		const auto touch = suggest("/interaction_profiles/oculus/touch_controller", {
+			{this->thumbstick_action_, "/user/hand/left/input/thumbstick"},
+			{this->thumbstick_action_, "/user/hand/right/input/thumbstick"},
+			{this->trigger_action_, "/user/hand/left/input/trigger/value"},
+			{this->trigger_action_, "/user/hand/right/input/trigger/value"},
+			{this->grip_action_, "/user/hand/left/input/squeeze/value"},
+			{this->grip_action_, "/user/hand/right/input/squeeze/value"},
+			{this->thumbstick_click_action_, "/user/hand/left/input/thumbstick/click"},
+			{this->thumbstick_click_action_, "/user/hand/right/input/thumbstick/click"},
+			{this->button_a_action_, "/user/hand/right/input/a/click"},
+			{this->button_b_action_, "/user/hand/right/input/b/click"},
+			{this->button_x_action_, "/user/hand/left/input/x/click"},
+			{this->button_y_action_, "/user/hand/left/input/y/click"},
+			{this->menu_action_, "/user/hand/left/input/menu/click"},
+			{this->haptic_action_, "/user/hand/left/output/haptic"},
+			{this->haptic_action_, "/user/hand/right/output/haptic"},
+		});
+
+		// Valve Index controllers: the left hand's A/B stand in for X/Y; there is no free menu button
+		suggest("/interaction_profiles/valve/index_controller", {
+			{this->thumbstick_action_, "/user/hand/left/input/thumbstick"},
+			{this->thumbstick_action_, "/user/hand/right/input/thumbstick"},
+			{this->trigger_action_, "/user/hand/left/input/trigger/value"},
+			{this->trigger_action_, "/user/hand/right/input/trigger/value"},
+			{this->grip_action_, "/user/hand/left/input/squeeze/value"},
+			{this->grip_action_, "/user/hand/right/input/squeeze/value"},
+			{this->thumbstick_click_action_, "/user/hand/left/input/thumbstick/click"},
+			{this->thumbstick_click_action_, "/user/hand/right/input/thumbstick/click"},
+			{this->button_a_action_, "/user/hand/right/input/a/click"},
+			{this->button_b_action_, "/user/hand/right/input/b/click"},
+			{this->button_x_action_, "/user/hand/left/input/a/click"},
+			{this->button_y_action_, "/user/hand/left/input/b/click"},
+			{this->haptic_action_, "/user/hand/left/output/haptic"},
+			{this->haptic_action_, "/user/hand/right/output/haptic"},
+		});
+
+		if (!touch)
+		{
+			throw xr_error("the runtime rejected the Touch controller bindings", false);
+		}
+	}
+
+	void xr_runtime::attach_actions()
+	{
+		if (this->action_set_ == XR_NULL_HANDLE || this->actions_attached_)
+		{
+			return;
+		}
+
+		XrSessionActionSetsAttachInfo info{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+		info.countActionSets = 1;
+		info.actionSets = &this->action_set_;
+
+		const auto result = xrAttachSessionActionSets(this->session_, &info);
+		if (XR_FAILED(result))
+		{
+			log::error("Couldn't attach the VR controller actions: {}", to_string(result));
+			return;
+		}
+
+		this->actions_attached_ = true;
+	}
+
+	void xr_runtime::log_interaction_profiles()
+	{
+		if (!this->actions_attached_)
+		{
+			return;
+		}
+
+		for (auto hand = 0; hand < 2; ++hand)
+		{
+			XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+			if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(this->session_, this->hand_paths_[hand], &state)))
+			{
+				log::info("{} controller: {}", hand == 0 ? "Left" : "Right",
+					state.interactionProfile == XR_NULL_PATH ? "none" : this->path_string(state.interactionProfile));
+			}
+		}
+	}
+
+	void xr_runtime::sync_input(input::controller_state& out)
+	{
+		out = {};
+
+		if (!this->actions_attached_ || !this->session_running_)
+		{
+			return;
+		}
+
+		out.connected = this->controllers_seen_;
+		if (this->session_state_ != XR_SESSION_STATE_FOCUSED)
+		{
+			return;
+		}
+
+		XrActiveActionSet active{this->action_set_, XR_NULL_PATH};
+		XrActionsSyncInfo sync_info{XR_TYPE_ACTIONS_SYNC_INFO};
+		sync_info.countActiveActionSets = 1;
+		sync_info.activeActionSets = &active;
+
+		const auto result = xrSyncActions(this->session_, &sync_info);
+		if (XR_FAILED(result))
+		{
+			this->report_once(std::format("xrSyncActions failed: {}", to_string(result)));
+			return;
+		}
+
+		if (result != XR_SUCCESS)
+		{
+			return; // XR_SESSION_NOT_FOCUSED: another app (the Meta menu) has the controllers
+		}
+
+		auto any_active = false;
+
+		const auto read_float = [&](const XrAction action, const XrPath hand)
+		{
+			XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+			info.action = action;
+			info.subactionPath = hand;
+
+			XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+			if (XR_FAILED(xrGetActionStateFloat(this->session_, &info, &state)) || !state.isActive)
+			{
+				return 0.0f;
+			}
+
+			any_active = true;
+			return state.currentState;
+		};
+
+		const auto read_bool = [&](const XrAction action, const XrPath hand)
+		{
+			XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+			info.action = action;
+			info.subactionPath = hand;
+
+			XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+			if (XR_FAILED(xrGetActionStateBoolean(this->session_, &info, &state)) || !state.isActive)
+			{
+				return false;
+			}
+
+			any_active = true;
+			return state.currentState == XR_TRUE;
+		};
+
+		const auto read_stick = [&](const XrAction action, const XrPath hand, float (&value)[2])
+		{
+			XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+			info.action = action;
+			info.subactionPath = hand;
+
+			XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
+			if (XR_FAILED(xrGetActionStateVector2f(this->session_, &info, &state)) || !state.isActive)
+			{
+				return;
+			}
+
+			any_active = true;
+			value[0] = state.currentState.x;
+			value[1] = state.currentState.y;
+		};
+
+		const auto left = this->hand_paths_[0];
+		const auto right = this->hand_paths_[1];
+
+		read_stick(this->thumbstick_action_, left, out.left_stick);
+		read_stick(this->thumbstick_action_, right, out.right_stick);
+		out.left_trigger = read_float(this->trigger_action_, left);
+		out.right_trigger = read_float(this->trigger_action_, right);
+		out.left_grip = read_float(this->grip_action_, left);
+		out.right_grip = read_float(this->grip_action_, right);
+		out.left_stick_click = read_bool(this->thumbstick_click_action_, left);
+		out.right_stick_click = read_bool(this->thumbstick_click_action_, right);
+		out.a = read_bool(this->button_a_action_, XR_NULL_PATH);
+		out.b = read_bool(this->button_b_action_, XR_NULL_PATH);
+		out.x = read_bool(this->button_x_action_, XR_NULL_PATH);
+		out.y = read_bool(this->button_y_action_, XR_NULL_PATH);
+		out.menu = read_bool(this->menu_action_, XR_NULL_PATH);
+		out.active = any_active;
+
+		if (any_active)
+		{
+			this->controllers_seen_ = true;
+			out.connected = true;
+		}
+
+		++this->input_syncs_;
+		if (any_active && !this->controllers_logged_)
+		{
+			this->controllers_logged_ = true;
+			log::info("VR controllers active");
+			this->log_interaction_profiles();
+		}
+	}
+
+	void xr_runtime::apply_haptics(const float left, const float right)
+	{
+		if (!this->actions_attached_ || this->session_state_ != XR_SESSION_STATE_FOCUSED)
+		{
+			return;
+		}
+
+		const float amplitude[2]{left, right};
+		for (auto hand = 0; hand < 2; ++hand)
+		{
+			XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
+			info.action = this->haptic_action_;
+			info.subactionPath = this->hand_paths_[hand];
+
+			if (amplitude[hand] > 0.01f)
+			{
+				XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+				vibration.amplitude = std::min(amplitude[hand], 1.0f);
+				vibration.duration = 50'000'000; // 50 ms, renewed every frame for as long as the game keeps rumbling
+				vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+				xrApplyHapticFeedback(this->session_, &info, reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+			}
+			else if (this->haptic_amplitude_[hand] > 0.01f)
+			{
+				xrStopHapticFeedback(this->session_, &info);
+			}
+
+			this->haptic_amplitude_[hand] = amplitude[hand];
+		}
+	}
+
+	// ---- runtime performance counters and refresh rate (Meta extensions) ------------------------------------------------
+
+	void xr_runtime::setup_performance_metrics()
+	{
+		if (!this->has_performance_metrics_)
+		{
+			return;
+		}
+
+		PFN_xrEnumeratePerformanceMetricsCounterPathsMETA enumerate = nullptr;
+		PFN_xrSetPerformanceMetricsStateMETA set_state = nullptr;
+		if (XR_FAILED(xrGetInstanceProcAddr(this->instance_, "xrEnumeratePerformanceMetricsCounterPathsMETA",
+				reinterpret_cast<PFN_xrVoidFunction*>(&enumerate)))
+			|| XR_FAILED(xrGetInstanceProcAddr(this->instance_, "xrSetPerformanceMetricsStateMETA",
+				reinterpret_cast<PFN_xrVoidFunction*>(&set_state)))
+			|| XR_FAILED(xrGetInstanceProcAddr(this->instance_, "xrQueryPerformanceMetricsCounterMETA",
+				reinterpret_cast<PFN_xrVoidFunction*>(&this->query_performance_counter_))))
+		{
+			this->query_performance_counter_ = nullptr;
+			log::warn("The runtime lists XR_META_performance_metrics but its functions are missing");
+			return;
+		}
+
+		XrPerformanceMetricsStateMETA state{XR_TYPE_PERFORMANCE_METRICS_STATE_META};
+		state.enabled = XR_TRUE;
+		auto result = set_state(this->session_, &state);
+		if (XR_FAILED(result))
+		{
+			this->query_performance_counter_ = nullptr;
+			log::warn("Couldn't enable the runtime's performance counters: {}", to_string(result));
+			return;
+		}
+
+		std::uint32_t count = 0;
+		result = enumerate(this->instance_, 0, &count, nullptr);
+		if (XR_FAILED(result) || count == 0)
+		{
+			return;
+		}
+
+		std::vector<XrPath> paths(count);
+		if (XR_FAILED(enumerate(this->instance_, count, &count, paths.data())))
+		{
+			return;
+		}
+
+		std::string names;
+		for (const auto path : paths)
+		{
+			auto name = this->path_string(path);
+			names += name;
+			names += ' ';
+			this->performance_counters_.emplace_back(path, std::move(name));
+		}
+
+		log::info("Runtime performance counters: {}", names);
+	}
+
+	std::string xr_runtime::performance_report()
+	{
+		if (!this->query_performance_counter_ || this->performance_counters_.empty() || !this->session_running_)
+		{
+			return {};
+		}
+
+		std::string report;
+		for (const auto& [path, name] : this->performance_counters_)
+		{
+			XrPerformanceMetricsCounterMETA counter{XR_TYPE_PERFORMANCE_METRICS_COUNTER_META};
+			if (XR_FAILED(this->query_performance_counter_(this->session_, path, &counter))
+				|| !(counter.counterFlags & XR_PERFORMANCE_METRICS_COUNTER_ANY_VALUE_VALID_BIT_META))
+			{
+				continue;
+			}
+
+			std::string_view short_name = name;
+			constexpr std::string_view prefix = "/perfmetrics_meta/";
+			if (short_name.starts_with(prefix))
+			{
+				short_name.remove_prefix(prefix.size());
+			}
+
+			const char* unit = "";
+			switch (counter.counterUnit)
+			{
+			case XR_PERFORMANCE_METRICS_COUNTER_UNIT_PERCENTAGE_META: unit = "%"; break;
+			case XR_PERFORMANCE_METRICS_COUNTER_UNIT_MILLISECONDS_META: unit = " ms"; break;
+			case XR_PERFORMANCE_METRICS_COUNTER_UNIT_BYTES_META: unit = " B"; break;
+			case XR_PERFORMANCE_METRICS_COUNTER_UNIT_HERTZ_META: unit = " Hz"; break;
+			default: break;
+			}
+
+			if (counter.counterFlags & XR_PERFORMANCE_METRICS_COUNTER_FLOAT_VALUE_VALID_BIT_META)
+			{
+				report += std::format("{} {:.2f}{}, ", short_name, counter.floatValue, unit);
+			}
+			else
+			{
+				report += std::format("{} {}{}, ", short_name, counter.uintValue, unit);
+			}
+		}
+
+		if (report.size() >= 2)
+		{
+			report.resize(report.size() - 2);
+		}
+
+		return report;
+	}
+
+	void xr_runtime::setup_refresh_rate()
+	{
+		if (!this->has_refresh_rate_)
+		{
+			return;
+		}
+
+		PFN_xrEnumerateDisplayRefreshRatesFB enumerate = nullptr;
+		if (XR_FAILED(xrGetInstanceProcAddr(this->instance_, "xrEnumerateDisplayRefreshRatesFB",
+				reinterpret_cast<PFN_xrVoidFunction*>(&enumerate)))
+			|| XR_FAILED(xrGetInstanceProcAddr(this->instance_, "xrGetDisplayRefreshRateFB",
+				reinterpret_cast<PFN_xrVoidFunction*>(&this->get_refresh_rate_)))
+			|| XR_FAILED(xrGetInstanceProcAddr(this->instance_, "xrRequestDisplayRefreshRateFB",
+				reinterpret_cast<PFN_xrVoidFunction*>(&this->request_refresh_rate_))))
+		{
+			this->get_refresh_rate_ = nullptr;
+			this->request_refresh_rate_ = nullptr;
+			log::warn("The runtime lists XR_FB_display_refresh_rate but its functions are missing");
+			return;
+		}
+
+		std::uint32_t count = 0;
+		if (XR_SUCCEEDED(enumerate(this->session_, 0, &count, nullptr)) && count > 0)
+		{
+			this->refresh_rates_.resize(count);
+			if (XR_FAILED(enumerate(this->session_, count, &count, this->refresh_rates_.data())))
+			{
+				this->refresh_rates_.clear();
+			}
+		}
+
+		auto current = 0.0f;
+		this->get_refresh_rate_(this->session_, &current);
+
+		std::string rates;
+		for (const auto rate : this->refresh_rates_)
+		{
+			rates += std::format("{:.0f} ", rate);
+		}
+
+		log::info("Headset refresh rate: {:.0f} Hz (available: {}); set vr_refresh_rate to change it", current, rates);
+	}
+
+	void xr_runtime::request_refresh_rate(const float hz)
+	{
+		if (!this->request_refresh_rate_ || !this->session_running_ || hz <= 0.0f
+			|| std::abs(hz - this->requested_refresh_rate_) < 0.5f)
+		{
+			return;
+		}
+
+		this->requested_refresh_rate_ = hz;
+
+		const auto match = std::find_if(this->refresh_rates_.begin(), this->refresh_rates_.end(), [hz](const float rate)
+		{
+			return std::abs(rate - hz) < 0.5f;
+		});
+
+		if (match == this->refresh_rates_.end())
+		{
+			std::string rates;
+			for (const auto rate : this->refresh_rates_)
+			{
+				rates += std::format("{:.0f} ", rate);
+			}
+
+			log::warn("The headset doesn't offer {:.0f} Hz (available: {})", hz, rates);
+			return;
+		}
+
+		const auto result = this->request_refresh_rate_(this->session_, *match);
+		if (XR_FAILED(result))
+		{
+			log::warn("Couldn't switch the headset to {:.0f} Hz: {}", hz, to_string(result));
+		}
+		else
+		{
+			log::info("Asked the headset for {:.0f} Hz", hz);
+		}
+	}
+
 	void xr_runtime::report_once(const std::string& problem)
 	{
 		if (this->reported_problems_.insert(problem).second)
@@ -854,12 +1412,13 @@ namespace vr
 
 	std::string xr_runtime::status() const
 	{
-		return std::format("runtime: {} | headset: {} | session: {} | state: {} | frames shown: {} ({} head-tracked) | image: {}x{} {}",
+		return std::format("runtime: {} | headset: {} | session: {} | state: {} | frames shown: {} ({} head-tracked) | image: {}x{} {} | controller reads: {}",
 			this->runtime_name_,
 			this->system_name_.empty() ? "not found yet" : this->system_name_,
 			this->session_ != XR_NULL_HANDLE ? (this->session_running_ ? "running" : "created") : "none",
 			to_string(this->session_state_),
 			this->frames_submitted_, this->projected_frames_,
-			this->screen_.width, this->screen_.height, format_name(this->screen_.format));
+			this->screen_.width, this->screen_.height, format_name(this->screen_.format),
+			this->actions_attached_ ? std::to_string(this->input_syncs_) : std::string("unavailable"));
 	}
 }

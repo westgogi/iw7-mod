@@ -5,6 +5,7 @@
 #include "vr_log.hpp"
 #include "xr_runtime.hpp"
 #include "head_tracking.hpp"
+#include "input.hpp"
 
 #include "component/command.hpp"
 #include "component/directx.hpp"
@@ -134,6 +135,14 @@ namespace vr
 		game::dvar_t* vr_screen_height = nullptr;
 		game::dvar_t* vr_screen_follow_head = nullptr;
 		game::dvar_t* vr_screen_srgb = nullptr;
+		game::dvar_t* vr_refresh_rate = nullptr;
+
+		// performance log, every 10 s while the headset shows frames
+		constexpr auto performance_log_interval = 10s;
+		vr_clock::time_point last_performance_log{};
+		std::uint64_t presents_since_log = 0;
+		std::uint64_t submits_since_log = 0;
+		std::uint64_t tracked_since_log = 0;
 
 		// the game guards its D3D11 immediate context with a Win32 mutex; we take it for anything that may touch the context
 		class d3d_lock_guard
@@ -283,6 +292,7 @@ namespace vr
 			}
 
 			console::info("[VR] %s\n", head_tracking::status().data());
+			console::info("[VR] %s\n", input::status().data());
 		}
 
 		void destroy_runtime()
@@ -310,6 +320,51 @@ namespace vr
 		};
 	}
 
+	namespace
+	{
+		// Whatever path on_present takes, the controllers end up published once per present: inactive unless the
+		// frame loop managed to read them this frame
+		struct controller_publisher
+		{
+			input::controller_state state{};
+
+			~controller_publisher()
+			{
+				input::publish(this->state);
+			}
+		};
+
+		void log_performance(xr_runtime& xr)
+		{
+			const auto now = vr_clock::now();
+			if (last_performance_log == vr_clock::time_point{})
+			{
+				last_performance_log = now;
+				return;
+			}
+
+			const auto elapsed = std::chrono::duration<double>(now - last_performance_log).count();
+			if (elapsed < std::chrono::duration<double>(performance_log_interval).count())
+			{
+				return;
+			}
+
+			if (submits_since_log > 0)
+			{
+				const auto counters = xr.performance_report();
+				log::info("Perf: game {:.1f} fps, headset frames {:.1f}/s ({:.0f}% head-tracked){}{}",
+					static_cast<double>(presents_since_log) / elapsed, static_cast<double>(submits_since_log) / elapsed,
+					100.0 * static_cast<double>(tracked_since_log) / static_cast<double>(submits_since_log),
+					counters.empty() ? "" : " | runtime: ", counters);
+			}
+
+			last_performance_log = now;
+			presents_since_log = 0;
+			submits_since_log = 0;
+			tracked_since_log = 0;
+		}
+	}
+
 	bool locate_predicted(const float frames_ahead, view_state& out)
 	{
 		std::lock_guard _(pose_mutex);
@@ -333,6 +388,8 @@ namespace vr
 
 		// always take this frame's record, so records stay matched to presents even when VR is idle
 		const auto record = head_tracking::pop_frame_record();
+		controller_publisher controllers{};
+		++presents_since_log;
 
 		if (vr_disabled || !swap_chain || !dx::device || !dx::deviceContext)
 		{
@@ -395,6 +452,19 @@ namespace vr
 			return;
 		}
 
+		runtime->sync_input(controllers.state);
+		{
+			auto left = 0.0f;
+			auto right = 0.0f;
+			input::rumble(left, right);
+			runtime->apply_haptics(left, right);
+		}
+
+		if (vr_refresh_rate)
+		{
+			runtime->request_refresh_rate(static_cast<float>(vr_refresh_rate->current.integer));
+		}
+
 		ID3D11Texture2D* back_buffer = nullptr;
 		if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer))))
 		{
@@ -413,6 +483,14 @@ namespace vr
 		{
 			back_buffer->Release();
 		}
+
+		++submits_since_log;
+		if (record.head_tracked)
+		{
+			++tracked_since_log;
+		}
+
+		log_performance(*runtime);
 	}
 
 	class component final : public component_interface
@@ -444,6 +522,8 @@ namespace vr
 				"VR: lock the virtual screen to your head instead of the room");
 			vr_screen_srgb = game::Dvar_RegisterBool("vr_screen_srgb", true, game::DVAR_FLAG_SAVED,
 				"VR: treat the game image as sRGB. Turn off if the headset image looks too dark, on if it looks washed out");
+			vr_refresh_rate = game::Dvar_RegisterInt("vr_refresh_rate", 0, 0, 144, game::DVAR_FLAG_SAVED,
+				"VR: ask the headset for this refresh rate in Hz (e.g. 72, 80, 90, 120); 0 = leave it as set in the headset software");
 
 			command::add("vr_recenter", []
 			{

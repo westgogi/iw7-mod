@@ -13,6 +13,11 @@
 
 namespace vr
 {
+	namespace input
+	{
+		struct controller_state;
+	}
+
 	// Thrown when VR can't start. retry() is true for conditions that usually clear up on their own
 	// (runtime still starting, Link not connected yet) and false when the user has to change something.
 	class xr_error : public std::runtime_error
@@ -106,6 +111,18 @@ namespace vr
 		void request_recenter();
 		std::string status() const;
 
+		// Reads the VR controllers. Call once per frame after wait_frame(); `out` is inactive when they can't be read.
+		void sync_input(input::controller_state& out);
+
+		// Vibration per hand, 0..1; re-applied every frame while non-zero
+		void apply_haptics(float left, float right);
+
+		// One line of the runtime's own performance counters (Meta runtimes); empty when unavailable
+		std::string performance_report();
+
+		// Ask the headset for another refresh rate (Meta runtimes); 0 or an unavailable rate does nothing
+		void request_refresh_rate(float hz);
+
 	private:
 		struct screen_swapchain
 		{
@@ -140,6 +157,35 @@ namespace vr
 		XrPosef anchor_{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 		bool recenter_requested_ = true;
 
+		// controllers
+		XrActionSet action_set_ = XR_NULL_HANDLE;
+		XrAction thumbstick_action_ = XR_NULL_HANDLE;
+		XrAction trigger_action_ = XR_NULL_HANDLE;
+		XrAction grip_action_ = XR_NULL_HANDLE;
+		XrAction thumbstick_click_action_ = XR_NULL_HANDLE;
+		XrAction button_a_action_ = XR_NULL_HANDLE;
+		XrAction button_b_action_ = XR_NULL_HANDLE;
+		XrAction button_x_action_ = XR_NULL_HANDLE;
+		XrAction button_y_action_ = XR_NULL_HANDLE;
+		XrAction menu_action_ = XR_NULL_HANDLE;
+		XrAction haptic_action_ = XR_NULL_HANDLE;
+		XrPath hand_paths_[2]{XR_NULL_PATH, XR_NULL_PATH};
+		bool actions_attached_ = false;
+		bool controllers_logged_ = false;
+		bool controllers_seen_ = false; // the controllers have given input during this session
+		float haptic_amplitude_[2]{};
+		std::uint64_t input_syncs_ = 0;
+
+		// optional extensions
+		bool has_performance_metrics_ = false;
+		bool has_refresh_rate_ = false;
+		PFN_xrQueryPerformanceMetricsCounterMETA query_performance_counter_ = nullptr;
+		std::vector<std::pair<XrPath, std::string>> performance_counters_;
+		PFN_xrRequestDisplayRefreshRateFB request_refresh_rate_ = nullptr;
+		PFN_xrGetDisplayRefreshRateFB get_refresh_rate_ = nullptr;
+		std::vector<float> refresh_rates_;
+		float requested_refresh_rate_ = 0.0f;
+
 		std::string runtime_name_ = "unknown";
 		std::string system_name_;
 		std::uint32_t eye_width_ = 0;
@@ -149,6 +195,12 @@ namespace vr
 		std::unordered_set<std::string> reported_problems_;
 
 		void log_system_properties();
+		void create_actions();
+		void attach_actions();
+		void log_interaction_profiles();
+		void setup_performance_metrics();
+		void setup_refresh_rate();
+		std::string path_string(XrPath path) const;
 		void query_swapchain_formats();
 		void pick_blend_mode();
 		bool handle_state_change(XrSessionState state);

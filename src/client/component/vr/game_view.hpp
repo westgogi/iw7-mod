@@ -15,6 +15,14 @@ namespace vr::game_view
 	constexpr std::uintptr_t aim_adjust = 0x1405BC540;
 	constexpr std::size_t aim_input_local_client = 0x30;
 
+	// Builds a reversed-Z infinite projection matrix: void (float tanHalfFovX, float tanHalfFovY, float zNear, float* out)
+	// out = {1/tanX, 1/tanY, m23 = 1, m32 = zNear}. Every perspective view the renderer draws goes through it.
+	constexpr std::uintptr_t projection_matrix = 0x140CE0E90;
+
+	// bool (int controllerIndex): the profile's "gamepad enabled" option (profile byte 0xC0, "gpadEnabled").
+	// The game ignores the gamepad while it returns false.
+	constexpr std::uintptr_t gamepad_enabled = 0x140337800;
+
 	// refdef_t lives at cg_s + 0x4B38; RefdefView at refdef + 0x10
 	struct refdef_view
 	{
@@ -22,7 +30,18 @@ namespace vr::game_view
 		float tan_half_fov_y;
 		float origin[3];
 		float axis[3][3]; // forward, left, up
+		float z_near;     // 0 = use the renderer's default (r_zPlanes)
+		// Second FOV pair. The frame's view setup copies it into the renderer's view info (+0x160) and the scene passes
+		// build their projection from it, so this is what the world is actually drawn with. The game sets it from
+		// the "dual FOV" (viewmodel) FOV while aiming down sights, otherwise it copies tan_half_fov_x/y into it before
+		// submit_view runs (cgame 0x140888AB0 / 0x1408B4550).
+		float draw_tan_half_fov[2];
 	};
+
+	static_assert(offsetof(refdef_view, origin) == 0x08);
+	static_assert(offsetof(refdef_view, axis) == 0x14);
+	static_assert(offsetof(refdef_view, z_near) == 0x38);
+	static_assert(offsetof(refdef_view, draw_tan_half_fov) == 0x3C);
 
 	inline refdef_view* view(std::uint8_t* refdef)
 	{
