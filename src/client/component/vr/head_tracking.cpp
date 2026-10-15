@@ -82,6 +82,7 @@ namespace vr::head_tracking
 		// the head yaw whose turns have been fed into the game's aim so far (same units as pose.yaw)
 		bool aim_baseline_valid = false;
 		float last_aim_yaw = 0.0f;
+		float stick_turned = 0.0f; // everything the right stick has turned the player, for the aim timing measurement
 		float last_game_pitch = 0.0f; // the game's own view pitch last frame, before our camera override
 
 		std::optional<projection_info> pending_projection;
@@ -138,10 +139,11 @@ namespace vr::head_tracking
 		public:
 			static constexpr int max_lag = 2;
 
-			// apply_camera, once per frame: the fed head yaw (last_aim_yaw) and the game's own view yaw
-			void record(const std::uint64_t frame, const float fed_yaw, const float game_yaw)
+			// apply_camera, once per frame: the fed head yaw (last_aim_yaw), everything the right stick turned so far and
+			// the game's own view yaw
+			void record(const std::uint64_t frame, const float fed_yaw, const float turned, const float game_yaw)
 			{
-				this->history_[frame % history_size] = {frame, fed_yaw, game_yaw};
+				this->history_[frame % history_size] = {frame, fed_yaw, turned, game_yaw};
 
 				const auto* previous = this->find(frame - 1);
 				if (!previous)
@@ -160,8 +162,8 @@ namespace vr::head_tracking
 						return;
 					}
 
-					fed_turn[lag] = math::wrap_degrees(a->fed - b->fed);
-					motion += std::abs(fed_turn[lag]);
+					fed_turn[lag] = math::wrap_degrees((a->fed + a->turned) - (b->fed + b->turned));
+					motion += std::abs(math::wrap_degrees(a->fed - b->fed));
 				}
 
 				const auto game_turn = math::wrap_degrees(game_yaw - previous->game);
@@ -193,13 +195,13 @@ namespace vr::head_tracking
 				if (!this->reported_)
 				{
 					this->reported_ = true;
-					log::info("Aim timing: the game shows a head turn {} frame(s) after we feed it (fit errors {:.3f} / {:.3f} / {:.3f})",
+					log::info("Aim timing measured: the game shows a head turn {} frame(s) after we feed it (fit errors {:.3f} / {:.3f} / {:.3f})",
 						best, this->error_[0], this->error_[1], this->error_[2]);
 				}
 
 				if (best != this->lag_ && this->error_[best] < 0.5 * this->error_[this->lag_])
 				{
-					log::info("Aim timing changed: {} -> {} frame(s) (fit errors {:.3f} / {:.3f} / {:.3f})",
+					log::info("Aim timing measurement changed: {} -> {} frame(s) (fit errors {:.3f} / {:.3f} / {:.3f})",
 						this->lag_, best, this->error_[0], this->error_[1], this->error_[2]);
 					this->lag_ = best;
 				}
@@ -248,6 +250,7 @@ namespace vr::head_tracking
 			{
 				std::uint64_t frame = 0;
 				float fed = 0.0f;
+				float turned = 0.0f;
 				float game = 0.0f;
 			};
 
@@ -372,7 +375,9 @@ namespace vr::head_tracking
 			}
 
 			// right stick: smooth or snap turn
-			output[1] += input::turn_degrees();
+			const auto turn = input::turn_degrees();
+			output[1] += turn;
+			stick_turned = math::wrap_degrees(stick_turned + turn);
 
 			if (!vr_head_aim->current.enabled)
 			{
@@ -433,7 +438,7 @@ namespace vr::head_tracking
 			last_game_pitch = -std::asin(std::clamp(game_forward.z, -1.0f, 1.0f)) * math::to_degrees;
 
 			// the camera faces the game's yaw plus whatever head turn the game's view doesn't show yet
-			aim_lag.record(frame_number, last_aim_yaw, game_yaw);
+			aim_lag.record(frame_number, last_aim_yaw, stick_turned, game_yaw);
 			const auto camera_yaw = game_yaw + math::wrap_degrees(pose.yaw - aim_lag.shown_yaw(frame_number, last_aim_yaw));
 
 			// the head's rotation is applied relative to this heading
@@ -876,8 +881,9 @@ namespace vr::head_tracking
 				"VR: game units per metre of head movement");
 			vr_predict_frames = game::Dvar_RegisterFloat("vr_predict_frames", 1.0f, 0.0f, 4.0f, game::DVAR_FLAG_SAVED,
 				"VR: how many frames ahead to predict the head pose");
-			vr_aim_lag = game::Dvar_RegisterInt("vr_aim_lag", -1, -1, 2, game::DVAR_FLAG_NONE,
-				"VR: frames between feeding the game a head turn and its view showing it. -1 = measure automatically");
+			vr_aim_lag = game::Dvar_RegisterInt("vr_aim_lag", 0, -1, 2, game::DVAR_FLAG_NONE,
+				"VR: frames between feeding the game a head turn and its view showing it (measured as 0 in the campaign). "
+				"-1 = use the live measurement");
 			vr_stereo = game::Dvar_RegisterBool("vr_stereo", true, game::DVAR_FLAG_SAVED,
 				"VR: 3D. Each frame is drawn from one eye, alternating left and right. 0 = both eyes see the same picture");
 			vr_stereo_swap = game::Dvar_RegisterBool("vr_stereo_swap", false, game::DVAR_FLAG_NONE,
